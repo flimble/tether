@@ -1,0 +1,6 @@
+# Minimal Maestro flow - just launch Settings and verify
+appId: com.android.settings
+
+---
+- launchApp
+- assertVisible: "Search settings"

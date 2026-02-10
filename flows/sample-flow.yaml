@@ -1,0 +1,15 @@
+# Sample Maestro flow for prototype testing
+# This flow tests basic Maestro integration without requiring a specific app
+
+appId: com.android.settings
+
+---
+- launchApp
+
+- assertVisible: "Search settings"
+
+- tapOn: "Network & internet"
+
+- assertVisible: "Wi-Fi"
+
+- pressKey: "home"

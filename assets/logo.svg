@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 200" fill="none">
+  <defs>
+    <linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#a855f7"/>
+    </linearGradient>
+  </defs>
+  <!-- Phone outline -->
+  <rect x="30" y="20" width="100" height="160" rx="16" stroke="url(#g1)" stroke-width="6" fill="none"/>
+  <!-- Screen -->
+  <rect x="42" y="40" width="76" height="120" rx="4" fill="url(#g1)" opacity="0.12"/>
+  <!-- Tether line from phone to agent (rope/chain motif) -->
+  <line x1="130" y1="70" x2="185" y2="70" stroke="url(#g1)" stroke-width="3" stroke-dasharray="6,4"/>
+  <line x1="130" y1="100" x2="185" y2="100" stroke="url(#g1)" stroke-width="3"/>
+  <line x1="130" y1="130" x2="185" y2="130" stroke="url(#g1)" stroke-width="3" stroke-dasharray="6,4"/>
+  <!-- Agent eye on phone screen -->
+  <ellipse cx="80" cy="95" rx="22" ry="14" stroke="url(#g1)" stroke-width="3.5" fill="none"/>
+  <circle cx="80" cy="95" r="7" fill="url(#g1)"/>
+  <!-- Text: tether -->
+  <text x="195" y="125" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="80" font-weight="700" fill="url(#g1)">tether</text>
+</svg>

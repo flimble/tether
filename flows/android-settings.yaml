@@ -1,0 +1,6 @@
+# Android Settings flow - test Maestro integration
+appId: com.android.settings
+
+---
+- launchApp
+- assertVisible: "Search settings"

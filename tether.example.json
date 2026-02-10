@@ -1,0 +1,10 @@
+{
+  "platform": "android",
+  "avd": "Pixel_XL_API_29",
+  "appId": "com.example.myapp",
+  "timeouts": {
+    "boot": 90,
+    "flow": 180,
+    "screenshot": 10
+  }
+}
