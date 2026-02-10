@@ -37,10 +37,27 @@ tether watch                # auto-capture on UI changes
 python3 test_tether.py -v   # 58 unit tests
 ```
 
+## Releasing
+
+To create a new release, just tag and push:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+This automatically:
+1. Runs tests
+2. Bumps the version in `pyproject.toml` on main
+3. Creates a GitHub Release with auto-generated notes
+4. Updates the Homebrew formula in `flimble/homebrew-tap` with the new sha256
+
+Do NOT manually edit the version in `pyproject.toml` -- the release workflow handles it.
+
 ## Development Rules
 
-- Keep it as a single file with zero dependencies
+- Keep it as a single file (`src/tether/cli.py`) with zero dependencies
 - All commands must work on both Android and iOS via the Platform abstraction
 - Element parsing must filter noise (NOISE_CLASSES, IOS_NOISE_ROLES, SYSTEM_RES_IDS)
 - Never hang -- all subprocess calls must have timeouts
-- Tests use exec() to load the module (not importlib) since tether has no .py extension
+- Tests use exec() to load the module (not importlib) since cli.py is loaded dynamically
