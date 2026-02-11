@@ -256,10 +256,6 @@ The `--help` output is comprehensive and most agents can figure it out from ther
 
 tether ships with an agent skill in `skills/tether/`. Copy it into your project or personal skills directory for richer context:
 
-```bash
-cp -r skills/tether ~/.factory/skills/tether
-```
-
 This gives AI agents automatic access to tether's commands, config format, and recommended workflow.
 
 ### AGENTS.md
