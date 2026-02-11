@@ -240,6 +240,40 @@ Key design decisions:
 - **Two-layer element filtering** -- Noise containers (FrameLayout, ViewGroup, AXGroup, etc.) and system elements are stripped out. Only meaningful, interactable elements are shown.
 - **Logcat integration** -- Background thread collects filtered logs (crashes, RN errors, Maestro output). On test failure, crash context is shown alongside the error.
 
+## Usage with AI Agents
+
+### Just ask the agent
+
+The simplest approach -- just tell your agent to use it:
+
+```
+Use tether to test the login flow on the Android emulator. Run tether --help to see available commands.
+```
+
+The `--help` output is comprehensive and most agents can figure it out from there.
+
+### AI Coding Assistants
+
+tether ships with an agent skill in `skills/tether/`. Copy it into your project or personal skills directory for richer context:
+
+```bash
+cp -r skills/tether ~/.factory/skills/tether
+```
+
+This gives AI agents automatic access to tether's commands, config format, and recommended workflow.
+
+### AGENTS.md
+
+For more consistent results, add to your project or global instructions file:
+
+```
+## Mobile Testing
+Use `tether` for mobile e2e test automation. Run `tether --help` for all commands.
+
+Workflow: tether doctor --fix → tether inspect → write flow YAML → tether flow <file>
+Use tether elements for selectors. Use tether inspect for screenshot + elements + logs in one call.
+```
+
 ## Acknowledgments
 
 Inspired by [agent-browser](https://github.com/vercel-labs/agent-browser) -- the browser automation CLI for AI agents. tether applies the same philosophy (screenshots, element refs, structured output for agents) to the mobile emulator world.
