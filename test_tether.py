@@ -556,7 +556,8 @@ class TestIOSLaunch(unittest.TestCase):
             return (0, "", "")
 
         with patch.dict(p.open_url.__globals__, {"run_cmd": fake_run_cmd}):
-            p.open_url("example://path?x=1")
+            with patch("shutil.which", return_value="/usr/local/bin/maestro"):
+                p.open_url("example://path?x=1")
 
         self.assertEqual(calls[0][:5], ["maestro", "--platform=ios", "--device", "SIM-123", "test"])
 
