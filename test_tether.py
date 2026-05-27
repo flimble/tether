@@ -2,6 +2,7 @@
 """Unit tests for tether CLI."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -35,6 +36,19 @@ NOISE_CLASSES = _ns["NOISE_CLASSES"]
 SYSTEM_RES_IDS = _ns["SYSTEM_RES_IDS"]
 IOS_NOISE_ROLES = _ns["IOS_NOISE_ROLES"]
 ET = _ns["ET"]
+parse_sniff_output = _ns["parse_sniff_output"]
+redact_sniff_entry = _ns["redact_sniff_entry"]
+_redact_header = _ns["_redact_header"]
+SniffCapture = _ns["SniffCapture"]
+CAPTURES_DIR = _ns["CAPTURES_DIR"]
+SNIFF_LAST = _ns["SNIFF_LAST"]
+_MITM_ADDON_TEMPLATE = _ns["_MITM_ADDON_TEMPLATE"]
+check_mitmproxy_installed = _ns["check_mitmproxy_installed"]
+check_mitmproxy_ca = _ns["check_mitmproxy_ca"]
+read_audit_events = _ns["read_audit_events"]
+cmd_open_url = _ns["cmd_open_url"]
+_maestro_tap_flow_yaml = _ns["_maestro_tap_flow_yaml"]
+_element_center_point = _ns["_element_center_point"]
 
 
 # === Android Element Parsing ===
@@ -431,6 +445,140 @@ class TestConfig(unittest.TestCase):
 
 # === Platform Selection ===
 
+class TestAndroidLaunch(unittest.TestCase):
+    def setUp(self):
+        _ns["cfg"] = Config(
+            platform="android", avd="test", app_id="com.test.app", android_home="/tmp",
+            emulator_bin="/tmp/emulator", simulator="",
+            timeout_boot=90, timeout_flow=180, timeout_screenshot=10,
+        )
+
+    def test_resolve_launch_activity_uses_package_resolver(self):
+        p = AndroidPlatform()
+        out = "priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false\ncom.test.app/com.example.MainActivity\n"
+        with patch.dict(p._resolve_launch_activity.__globals__, {"run_cmd": lambda *a, **k: (0, out, "")}):
+            self.assertEqual(p._resolve_launch_activity(), "com.test.app/com.example.MainActivity")
+
+    def test_resolve_launch_activity_falls_back_to_dot_main_activity(self):
+        p = AndroidPlatform()
+        with patch.dict(p._resolve_launch_activity.__globals__, {"run_cmd": lambda *a, **k: (1, "", "error")}):
+            self.assertEqual(p._resolve_launch_activity(), "com.test.app/.MainActivity")
+
+    def test_launch_accepts_explicit_app_id(self):
+        p = AndroidPlatform()
+        calls = []
+
+        def fake_run_cmd(args, **kwargs):
+            calls.append(args)
+            if "resolve-activity" in args:
+                return (0, "com.other.app/.MainActivity\n", "")
+            return (0, "Starting", "")
+
+        with patch.dict(p.launch_app.__globals__, {"run_cmd": fake_run_cmd}):
+            p.launch_app("com.other.app")
+
+        self.assertEqual(calls[0][-1], "com.other.app")
+        self.assertEqual(calls[1], ["adb", "shell", "am", "start", "-W", "-n", "com.other.app/.MainActivity"])
+
+    def test_close_accepts_explicit_app_id(self):
+        p = AndroidPlatform()
+        calls = []
+
+        def fake_run_cmd(args, **kwargs):
+            calls.append(args)
+            return (0, "", "")
+
+        with patch.dict(p.close_app.__globals__, {"run_cmd": fake_run_cmd}):
+            p.close_app("com.other.app")
+
+        self.assertEqual(calls[0], ["adb", "shell", "am", "force-stop", "com.other.app"])
+
+    def test_open_url_uses_android_view_intent(self):
+        p = AndroidPlatform()
+        calls = []
+
+        def fake_run_cmd(args, **kwargs):
+            calls.append(args)
+            return (0, "", "")
+
+        with patch.dict(p.open_url.__globals__, {"run_cmd": fake_run_cmd}):
+            p.open_url("example://path?x=1")
+
+        self.assertEqual(
+            calls[0],
+            [
+                "adb", "shell", "am", "start", "-W", "-a",
+                "android.intent.action.VIEW", "-d", "example://path?x=1",
+            ],
+        )
+
+
+class TestIOSLaunch(unittest.TestCase):
+    def setUp(self):
+        _ns["cfg"] = Config(
+            platform="ios", avd="", app_id="com.test.app", android_home="/tmp",
+            emulator_bin="/tmp/emulator", simulator="SIM-123",
+            timeout_boot=90, timeout_flow=180, timeout_screenshot=10,
+        )
+
+    def test_launch_accepts_explicit_app_id(self):
+        p = IOSPlatform()
+        calls = []
+
+        def fake_run_cmd(args, **kwargs):
+            calls.append(args)
+            return (0, "", "")
+
+        with patch.dict(p.launch_app.__globals__, {"run_cmd": fake_run_cmd}):
+            p.launch_app("com.other.app")
+
+        self.assertEqual(calls[0], ["xcrun", "simctl", "launch", "SIM-123", "com.other.app"])
+
+    def test_close_terminates_app(self):
+        p = IOSPlatform()
+        calls = []
+
+        def fake_run_cmd(args, **kwargs):
+            calls.append(args)
+            return (0, "", "")
+
+        with patch.dict(p.close_app.__globals__, {"run_cmd": fake_run_cmd}):
+            p.close_app("com.other.app")
+
+        self.assertEqual(calls[0], ["xcrun", "simctl", "terminate", "SIM-123", "com.other.app"])
+
+    def test_open_url_uses_maestro_when_app_id_is_configured(self):
+        p = IOSPlatform()
+        calls = []
+
+        def fake_run_cmd(args, **kwargs):
+            calls.append(args)
+            return (0, "", "")
+
+        with patch.dict(p.open_url.__globals__, {"run_cmd": fake_run_cmd}):
+            p.open_url("example://path?x=1")
+
+        self.assertEqual(calls[0][:5], ["maestro", "--platform=ios", "--device", "SIM-123", "test"])
+
+    def test_open_url_falls_back_to_simctl_without_app_id(self):
+        _ns["cfg"] = Config(
+            platform="ios", avd="", app_id="", android_home="/tmp",
+            emulator_bin="/tmp/emulator", simulator="SIM-123",
+            timeout_boot=90, timeout_flow=180, timeout_screenshot=10,
+        )
+        p = IOSPlatform()
+        calls = []
+
+        def fake_run_cmd(args, **kwargs):
+            calls.append(args)
+            return (0, "", "")
+
+        with patch.dict(p.open_url.__globals__, {"run_cmd": fake_run_cmd}):
+            p.open_url("example://path?x=1")
+
+        self.assertEqual(calls[0], ["xcrun", "simctl", "openurl", "SIM-123", "example://path?x=1"])
+
+
 class TestPlatformSelection(unittest.TestCase):
     def test_android_default(self):
         _ns["cfg"] = Config(
@@ -519,6 +667,290 @@ class TestCrossPlatformConsistency(unittest.TestCase):
             line = _format_element_line(el)
             self.assertIsInstance(line, str)
             self.assertTrue(len(line) > 0)
+
+
+# === Tap ===
+
+
+class TestTapCommand(unittest.TestCase):
+    def test_generates_text_tap_flow(self):
+        cfg = Config(
+            platform="ios", avd="Pixel_XL_API_29", app_id="com.example.app",
+            android_home="/tmp/android", emulator_bin="emulator", simulator="booted",
+            timeout_boot=90, timeout_flow=180, timeout_screenshot=10,
+        )
+        with patch.dict(_ns, {"cfg": cfg}):
+            self.assertEqual(
+                _maestro_tap_flow_yaml({"text": "Cancel"}),
+                'appId: com.example.app\n---\n- tapOn:\n    text: "Cancel"\n',
+            )
+
+    def test_generates_id_tap_flow(self):
+        cfg = Config(
+            platform="android", avd="Pixel_XL_API_29", app_id="com.example.app",
+            android_home="/tmp/android", emulator_bin="emulator", simulator="booted",
+            timeout_boot=90, timeout_flow=180, timeout_screenshot=10,
+        )
+        with patch.dict(_ns, {"cfg": cfg}):
+            self.assertEqual(
+                _maestro_tap_flow_yaml({"id": "Storybook.ListView.SearchBar"}),
+                'appId: com.example.app\n---\n- tapOn:\n    id: "Storybook.ListView.SearchBar"\n',
+            )
+
+    def test_calculates_center_point_from_android_bounds(self):
+        self.assertEqual(
+            _element_center_point({"bounds": "[10,20][30,60]"}),
+            "20,40",
+        )
+
+    def test_calculates_center_point_from_ios_frame(self):
+        self.assertEqual(
+            _element_center_point({"frame": {"x": 10, "y": 20, "width": 30, "height": 40}}),
+            "25,40",
+        )
+
+
+# === Sniff ===
+
+SAMPLE_SNIFF_NDJSON = (
+    '{"timestamp":"2026-03-10T09:30:00Z","method":"POST","url":"https://api.purchasely.io/v3/subscriptions",'
+    '"request_headers":{"Authorization":"Bearer eyJhbGciOiJS...token","Content-Type":"application/json"},'
+    '"request_body":{"product_id":"premium_monthly"},"status_code":403,'
+    '"response_headers":{"Content-Type":"application/json"},'
+    '"response_body":{"error":"token_expired"},"duration_ms":230}\n'
+    '{"timestamp":"2026-03-10T09:30:01Z","method":"GET","url":"https://googleapis.com/auth/token",'
+    '"request_headers":{"Cookie":"session=abc123def456"},'
+    '"request_body":null,"status_code":200,'
+    '"response_headers":{},"response_body":{"token":"new"},"duration_ms":50}\n'
+)
+
+
+class TestRedactHeader(unittest.TestCase):
+
+    def test_short_value_unchanged(self):
+        self.assertEqual(_redact_header("abc"), "abc")
+
+    def test_exactly_ten_unchanged(self):
+        self.assertEqual(_redact_header("0123456789"), "0123456789")
+
+    def test_long_value_redacted(self):
+        result = _redact_header("Bearer eyJhbGciOiJS")
+        self.assertEqual(result, "Bearer eyJ...redacted")
+        self.assertNotIn("OiJS", result)
+
+
+class TestRedactSniffEntry(unittest.TestCase):
+
+    def test_redacts_authorization(self):
+        entry = {
+            "request_headers": {"Authorization": "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9"},
+            "status_code": 200,
+        }
+        result = redact_sniff_entry(entry)
+        self.assertTrue(result["request_headers"]["Authorization"].endswith("...redacted"))
+
+    def test_redacts_cookie(self):
+        entry = {
+            "request_headers": {"Cookie": "session=abc123def456ghijk"},
+            "status_code": 200,
+        }
+        result = redact_sniff_entry(entry)
+        self.assertTrue(result["request_headers"]["Cookie"].endswith("...redacted"))
+
+    def test_preserves_other_headers(self):
+        entry = {
+            "request_headers": {"Content-Type": "application/json", "Authorization": "Bearer longtokenvalue"},
+            "status_code": 200,
+        }
+        result = redact_sniff_entry(entry)
+        self.assertEqual(result["request_headers"]["Content-Type"], "application/json")
+
+    def test_no_headers_key(self):
+        entry = {"status_code": 200}
+        result = redact_sniff_entry(entry)
+        self.assertEqual(result["status_code"], 200)
+
+    def test_does_not_mutate_original(self):
+        entry = {
+            "request_headers": {"Authorization": "Bearer longtokenvalue"},
+        }
+        original_val = entry["request_headers"]["Authorization"]
+        redact_sniff_entry(entry)
+        self.assertEqual(entry["request_headers"]["Authorization"], original_val)
+
+
+class TestParseSniffOutput(unittest.TestCase):
+
+    def test_parses_ndjson(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".ndjson", delete=False) as f:
+            f.write(SAMPLE_SNIFF_NDJSON)
+            f.flush()
+            entries = parse_sniff_output(f.name)
+        os.unlink(f.name)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0]["method"], "POST")
+        self.assertEqual(entries[0]["status_code"], 403)
+        self.assertEqual(entries[1]["method"], "GET")
+
+    def test_empty_file(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".ndjson", delete=False) as f:
+            f.write("")
+            f.flush()
+            entries = parse_sniff_output(f.name)
+        os.unlink(f.name)
+        self.assertEqual(entries, [])
+
+    def test_missing_file(self):
+        entries = parse_sniff_output("/tmp/nonexistent-tether-test.ndjson")
+        self.assertEqual(entries, [])
+
+    def test_ignores_bad_lines(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".ndjson", delete=False) as f:
+            f.write("not json\n")
+            f.write('{"valid": true}\n')
+            f.write("\n")
+            f.write("also bad\n")
+            f.flush()
+            entries = parse_sniff_output(f.name)
+        os.unlink(f.name)
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(entries[0]["valid"])
+
+    def test_preserves_all_fields(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".ndjson", delete=False) as f:
+            f.write(SAMPLE_SNIFF_NDJSON)
+            f.flush()
+            entries = parse_sniff_output(f.name)
+        os.unlink(f.name)
+        first = entries[0]
+        for key in ("timestamp", "method", "url", "request_headers",
+                     "request_body", "status_code", "response_headers",
+                     "response_body", "duration_ms"):
+            self.assertIn(key, first)
+
+
+class TestSniffCapture(unittest.TestCase):
+
+    def test_init_defaults(self):
+        cap = SniffCapture()
+        self.assertEqual(cap.filter_domains, [])
+        self.assertEqual(cap.port, 8080)
+        self.assertIsNone(cap._proc)
+
+    def test_init_custom(self):
+        cap = SniffCapture(filter_domains=["purchasely", "googleapis"], port=9090)
+        self.assertEqual(cap.filter_domains, ["purchasely", "googleapis"])
+        self.assertEqual(cap.port, 9090)
+
+    def test_write_addon_creates_file(self):
+        cap = SniffCapture(filter_domains=["test.com"])
+        with tempfile.NamedTemporaryFile(suffix=".ndjson", delete=False) as out:
+            addon_path = cap._write_addon(out.name)
+        self.assertTrue(os.path.exists(addon_path))
+        with open(addon_path) as f:
+            content = f.read()
+        self.assertIn("test.com", content)
+        self.assertIn("TetherAddon", content)
+        self.assertIn("def response", content)
+        self.assertIn("_redact", content)
+        os.unlink(addon_path)
+        os.unlink(out.name)
+
+
+class TestMitmAddonTemplate(unittest.TestCase):
+
+    def test_template_is_valid_python(self):
+        rendered = _MITM_ADDON_TEMPLATE.format(
+            filter_domains=["example.com"],
+            output_file="/tmp/test.ndjson",
+        )
+        compile(rendered, "<addon>", "exec")
+
+    def test_template_with_empty_filters(self):
+        rendered = _MITM_ADDON_TEMPLATE.format(
+            filter_domains=[],
+            output_file="/tmp/test.ndjson",
+        )
+        compile(rendered, "<addon>", "exec")
+
+    def test_template_contains_required_hooks(self):
+        rendered = _MITM_ADDON_TEMPLATE.format(
+            filter_domains=[],
+            output_file="/tmp/test.ndjson",
+        )
+        self.assertIn("def request(self, flow", rendered)
+        self.assertIn("def response(self, flow", rendered)
+        self.assertIn("addons = [TetherAddon()]", rendered)
+
+
+class TestAuditCommands(unittest.TestCase):
+
+    def test_read_audit_events_filters_by_run_surface_and_name(self):
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write(json.dumps({"runId": "run-1", "surface": "navigation", "name": "received"}) + "\n")
+            f.write(json.dumps({"runId": "run-2", "surface": "navigation", "name": "received"}) + "\n")
+            f.write("not-json\n")
+            audit_path = Path(f.name)
+        previous = _ns["AUDIT_FILE"]
+        _ns["AUDIT_FILE"] = audit_path
+        try:
+            self.assertEqual(
+                read_audit_events(run_id="run-1", surface="navigation", name="received"),
+                [{"runId": "run-1", "surface": "navigation", "name": "received"}],
+            )
+        finally:
+            _ns["AUDIT_FILE"] = previous
+            audit_path.unlink(missing_ok=True)
+
+    def test_open_url_json_collects_audit_events_and_logs(self):
+        class FakeCollector:
+            def drain(self):
+                return [{"line": "log", "severity": "info"}]
+
+        class FakePlatform:
+            def is_device_running(self):
+                return CheckResult("device", True, "ok", 1)
+
+            def start_log_collector(self):
+                return FakeCollector()
+
+            def open_url(self, url):
+                print(f"opened {url}")
+
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write(json.dumps({"runId": "run-1", "surface": "navigation", "name": "agentScreen.received"}) + "\n")
+            audit_path = Path(f.name)
+        previous_platform = _ns.get("platform")
+        previous_audit = _ns["AUDIT_FILE"]
+        _ns["platform"] = FakePlatform()
+        _ns["AUDIT_FILE"] = audit_path
+        try:
+            with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                cmd_open_url("app://test", audit_run_id="run-1", json_output=True)
+            output = json.loads(stdout.getvalue())
+            self.assertTrue(output["opened"])
+            self.assertEqual(output["message"], "opened app://test")
+            self.assertEqual(output["auditEvents"][0]["runId"], "run-1")
+            self.assertTrue(Path(output["logsPath"]).exists())
+        finally:
+            _ns["platform"] = previous_platform
+            _ns["AUDIT_FILE"] = previous_audit
+            audit_path.unlink(missing_ok=True)
+
+
+class TestSniffDoctorChecks(unittest.TestCase):
+
+    def test_check_mitmproxy_returns_check_result(self):
+        result = check_mitmproxy_installed()
+        self.assertIsInstance(result, CheckResult)
+        self.assertEqual(result.name, "mitmproxy installed")
+        self.assertFalse(result.critical)
+
+    def test_check_ca_returns_check_result(self):
+        result = check_mitmproxy_ca()
+        self.assertIsInstance(result, CheckResult)
+        self.assertEqual(result.name, "mitmproxy CA cert")
+        self.assertFalse(result.critical)
 
 
 if __name__ == "__main__":

@@ -108,6 +108,11 @@ tether flow flows/login.yaml
 | `tether doctor --fix` | Auto-fix issues (start adb server, boot emulator) |
 | `tether status` | Quick device state check |
 | `tether boot` | Start emulator/simulator if not running |
+| `tether install [path]` | Install an app binary onto the running device/simulator |
+| `tether launch [appId]` | Launch the configured app, or an explicit app ID |
+| `tether close [appId]` | Stop the configured app, or an explicit app ID |
+| `tether open-url <url>` | Open a URL or deep link on the running device/simulator |
+| `tether open-url <url> --audit-run-id <id> --json` | Open a URL while collecting matching `[agent-audit]` events and log artifact path |
 
 ### Visibility
 
@@ -142,10 +147,13 @@ The typical AI agent loop:
 
 ```
 1. tether doctor --fix      # ensure environment is ready
-2. tether inspect            # see screen state + elements + logs
-3. Write/edit flow YAML      # using element refs from inspect
-4. tether flow <file>        # run the test
-5. If FAIL: tether inspect   # see what went wrong, iterate
+2. tether boot              # start the target device if needed
+3. tether install <path>    # optional: install a local app binary
+4. tether launch            # optional: open the configured app
+5. tether inspect           # see screen state + elements + logs
+6. Write/edit flow YAML     # using element refs from inspect
+7. tether flow <file>       # run the test
+8. If FAIL: tether inspect  # see what went wrong, iterate
 ```
 
 The `inspect` command returns JSON that includes:
@@ -266,8 +274,8 @@ For more consistent results, add to your project or global instructions file:
 ## Mobile Testing
 Use `tether` for mobile e2e test automation. Run `tether --help` for all commands.
 
-Workflow: tether doctor --fix → tether inspect → write flow YAML → tether flow <file>
-Use tether elements for selectors. Use tether inspect for screenshot + elements + logs in one call.
+Workflow: tether doctor --fix → tether boot → tether inspect → write flow YAML → tether flow <file>
+Use tether install/launch/open-url for generic app setup. Use `tether open-url <url> --audit-run-id <id> --json` when a harness needs deep-link transport plus `[agent-audit]` evidence. Use tether elements for selectors. Use tether inspect for screenshot + elements + logs in one call.
 ```
 
 ## Acknowledgments

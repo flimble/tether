@@ -13,6 +13,11 @@ Gives AI agents visibility into Android emulators and iOS simulators for writing
 tether doctor [--fix]       # Validate entire stack (adb, emulator, maestro)
 tether boot                 # Ensure emulator/simulator is running
 tether status               # Quick state check
+tether install [path]       # Install app binary
+tether launch [appId]       # Launch configured or explicit app
+tether close [appId]        # Stop configured or explicit app
+tether open-url <url>       # Open URL or deep link
+tether open-url <url> --audit-run-id <id> --json  # Open URL and collect matching [agent-audit] events
 tether screen [path]        # Take screenshot (agent can view)
 tether elements             # Dump visible UI elements with @refs
 tether elements --json      # Machine-readable element dump
@@ -56,7 +61,8 @@ For iOS:
 
 1. Run `tether doctor` to validate the stack
 2. Run `tether boot` to start emulator/simulator
-3. Use `tether inspect` to see current state (screenshot + elements + logs)
-4. Write Maestro flow YAML based on visible elements and @refs
-5. Run `tether flow <path>` to test
-6. Check `tether last-error` on failure, iterate
+3. Optionally run `tether install <path>` and `tether launch` for app setup
+4. Use `tether inspect` to see current state (screenshot + elements + logs)
+5. Write Maestro flow YAML based on visible elements and @refs
+6. Run `tether flow <path>` to test
+7. Check `tether last-error` on failure, iterate

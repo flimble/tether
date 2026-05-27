@@ -7,7 +7,14 @@ Optimized for stability, visibility, and fast iteration.
 COMMANDS:
     tether doctor              Validate and fix the test environment
     tether status              Quick emulator state check (fast)
-    tether boot                Start emulator if not running
+    tether boot                Start emulator/simulator if not running
+    tether install [<path>]    Install app binary onto device/simulator
+    tether launch [appId]      Launch installed app
+    tether close [appId]       Stop installed app
+    tether reset [appId]       Reset app state without reinstalling
+    tether open-url <url>      Open URL or deep link on device/simulator
+    tether tap --text <text>   Tap visible text/id/ref via a generated Maestro flow
+    tether expo [--port N]     Ensure Expo dev server is running
     tether screen [path]       Screenshot current screen
     tether elements [--json]   List visible UI elements (with @refs)
     tether flow <file>         Run a Maestro flow (with logcat)
@@ -17,6 +24,8 @@ COMMANDS:
     tether watch               Watch for UI changes, auto-capture
     tether logcat [--follow]   Show filtered logcat (crashes, errors, RN)
     tether last-error          Show most recent failure
+    tether sniff               Capture HTTP traffic via mitmdump (Android)
+    tether audit               Read agent audit events (Sentry, Mixpanel, etc.)
 
 EXAMPLES:
     tether doctor              # First: ensure everything works
@@ -46,20 +55,27 @@ FILES:
     ~/.tether/progress.json    Test history
     /tmp/tether-screen.png     Latest screenshot
     /tmp/tether-failure.png    Screenshot on test failure
+    /tmp/tether-audit.jsonl    Agent audit events (Sentry, Mixpanel, etc.)
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
+import textwrap
 import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Static paths (not config-dependent)
@@ -67,6 +83,11 @@ PROGRESS_FILE = Path.home() / ".tether" / "progress.json"
 SCREEN_PATH = Path("/tmp/tether-screen.png")
 WATCH_MANIFEST = Path("/tmp/tether-watch.json")
 WATCH_ELEMENTS = Path("/tmp/tether-elements.json")
+CAPTURES_DIR = Path.home() / ".tether" / "captures"
+SNIFF_LAST = CAPTURES_DIR / "last.json"
+AUDIT_FILE = Path("/tmp/tether-audit.jsonl")
+
+_AUDIT_PREFIX = "[agent-audit]"
 
 # Hardcoded defaults
 _DEFAULTS = {
@@ -176,6 +197,7 @@ class LogcatCollector:
             line = line.rstrip()
             if not line:
                 continue
+            self._maybe_write_audit(line)
             if not self._matches(line):
                 continue
             entry = {
@@ -198,6 +220,18 @@ class LogcatCollector:
         if self._app_id and self._app_id in line:
             return True
         return any(p.search(line) for p in _LOGCAT_PATTERNS)
+
+    def _maybe_write_audit(self, line: str) -> None:
+        if _AUDIT_PREFIX not in line:
+            return
+        idx = line.find(_AUDIT_PREFIX)
+        json_part = line[idx + len(_AUDIT_PREFIX):].strip()
+        try:
+            event = json.loads(json_part)
+            with open(AUDIT_FILE, "a") as f:
+                f.write(json.dumps(event) + "\n")
+        except (json.JSONDecodeError, OSError):
+            pass
 
     def drain(self) -> list[dict]:
         """Return and clear buffered lines."""
@@ -258,6 +292,21 @@ class Platform:
         raise NotImplementedError
 
     def boot_device(self) -> None:
+        raise NotImplementedError
+
+    def install_app(self, path: str) -> None:
+        raise NotImplementedError
+
+    def launch_app(self, app_id: str | None = None) -> None:
+        raise NotImplementedError
+
+    def close_app(self, app_id: str | None = None) -> None:
+        raise NotImplementedError
+
+    def reset_app(self, app_id: str | None = None) -> None:
+        raise NotImplementedError
+
+    def open_url(self, url: str) -> None:
         raise NotImplementedError
 
     def screenshot(self, output: Path) -> bool:
@@ -350,7 +399,98 @@ class AndroidPlatform(Platform):
             report.add(check_adb_connection())
             report.add(check_screenshot())
             report.add(check_ui_dump())
+        mitmproxy_check = check_mitmproxy_installed()
+        if not mitmproxy_check.passed and auto_fix:
+            print("Installing mitmproxy...")
+            subprocess.run(["brew", "install", "mitmproxy"], capture_output=True, timeout=120)
+            mitmproxy_check = check_mitmproxy_installed()
+        report.add(mitmproxy_check)
+        if mitmproxy_check.passed:
+            report.add(check_mitmproxy_ca())
+            if emu_check.passed:
+                report.add(check_emulator_proxy())
         return report
+
+    def install_app(self, path: str) -> None:
+        p = Path(path)
+        if not p.exists():
+            print(f"APK not found: {path}")
+            sys.exit(1)
+        print(f"Installing {path}...")
+        if cfg.app_id:
+            run_cmd(["adb", "uninstall", cfg.app_id], timeout=30)
+        code, out, err = run_cmd(["adb", "install", "-r", path], timeout=120)
+        if code != 0:
+            print(f"Install failed: {err.strip()[:200] or out.strip()[:200]}")
+            sys.exit(1)
+        print("Installed.")
+
+    def _required_app_id(self, app_id: str | None = None) -> str:
+        resolved = app_id or cfg.app_id
+        if not resolved:
+            print("No appId provided. Set appId in tether.json or pass one to the command.")
+            sys.exit(1)
+        return resolved
+
+    def _resolve_launch_activity(self, app_id: str | None = None) -> str:
+        resolved_app_id = self._required_app_id(app_id)
+        code, out, _ = run_cmd(
+            ["adb", "shell", "cmd", "package", "resolve-activity", "--brief", resolved_app_id],
+            timeout=10,
+        )
+        if code == 0:
+            for line in reversed(out.splitlines()):
+                line = line.strip()
+                if "/" in line and resolved_app_id in line:
+                    return line
+        return f"{resolved_app_id}/.MainActivity"
+
+    def launch_app(self, app_id: str | None = None) -> None:
+        activity = self._resolve_launch_activity(app_id)
+        code, out, err = run_cmd(
+            ["adb", "shell", "am", "start", "-W", "-n", activity],
+            timeout=10,
+        )
+        combined = f"{out}\n{err}"
+        if code != 0 or "Error:" in combined:
+            print(f"Launch failed: {combined.strip()[:200]}")
+            sys.exit(1)
+        print("Launched.")
+
+    def close_app(self, app_id: str | None = None) -> None:
+        resolved_app_id = self._required_app_id(app_id)
+        code, out, err = run_cmd(
+            ["adb", "shell", "am", "force-stop", resolved_app_id],
+            timeout=10,
+        )
+        if code != 0:
+            print(f"Close failed: {(err or out).strip()[:200]}")
+            sys.exit(1)
+        print("Closed.")
+
+    def reset_app(self, app_id: str | None = None) -> None:
+        resolved_app_id = self._required_app_id(app_id)
+        self.close_app(resolved_app_id)
+        code, out, err = run_cmd(
+            ["adb", "shell", "pm", "clear", resolved_app_id],
+            timeout=30,
+        )
+        combined = f"{out}\n{err}"
+        if code != 0 or "Success" not in combined:
+            print(f"Reset failed: {combined.strip()[:200]}")
+            sys.exit(1)
+        print("Reset.")
+
+    def open_url(self, url: str) -> None:
+        code, out, err = run_cmd(
+            ["adb", "shell", "am", "start", "-W", "-a", "android.intent.action.VIEW", "-d", url],
+            timeout=10,
+        )
+        combined = f"{out}\n{err}"
+        if code != 0 or "Error:" in combined:
+            print(f"Open URL failed: {combined.strip()[:200]}")
+            sys.exit(1)
+        print("Opened URL.")
 
     def start_log_collector(self) -> LogcatCollector:
         lc = get_logcat()
@@ -410,6 +550,7 @@ class IOSLogCollector(LogcatCollector):
             # Skip the log stream filter confirmation line
             if line.startswith("Filtering the log data"):
                 continue
+            self._maybe_write_audit(line)
             entry = {"line": line, "ts": time.strftime("%H:%M:%S")}
             if re.search(r"fault|crash|SIGABRT|EXC_BAD_ACCESS", line, re.IGNORECASE):
                 entry["severity"] = "crash"
@@ -535,7 +676,7 @@ class IOSPlatform(Platform):
             report.add(CheckResult("xcrun simctl", False, "Xcode tools not installed", ms))
             return report
 
-        # Check axe installed
+        # Check axe installed (non-critical: screenshot works without it)
         start = time.perf_counter()
         axe_path = shutil.which("axe")
         ms = int((time.perf_counter() - start) * 1000)
@@ -543,7 +684,8 @@ class IOSPlatform(Platform):
             report.add(CheckResult("axe installed", True, axe_path, ms))
         else:
             report.add(CheckResult("axe installed", False,
-                                   "not found. Install: brew install cameroncooke/axe/axe", ms))
+                                   "not found. Install: brew install cameroncooke/axe/axe", ms,
+                                   critical=False))
 
         # Check Maestro
         report.add(check_maestro_installed())
@@ -583,6 +725,128 @@ class IOSPlatform(Platform):
                                        "axe not installed (non-critical)", 0, critical=False))
 
         return report
+
+    def install_app(self, path: str) -> None:
+        import tempfile
+        import zipfile as _zf
+        import shutil as _sh
+        p = Path(path)
+        if not p.exists():
+            print(f"Not found: {path}")
+            sys.exit(1)
+        if p.suffix == ".zip":
+            print(f"Unzipping {path}...")
+            tmp = Path(tempfile.mkdtemp())
+            try:
+                with _zf.ZipFile(p) as zf:
+                    zf.extractall(tmp)
+                apps = list(tmp.glob("*.app"))
+                if not apps:
+                    print("No .app bundle found in zip")
+                    sys.exit(1)
+                self._install_bundle(str(apps[0]))
+            finally:
+                _sh.rmtree(tmp, ignore_errors=True)
+        elif p.is_dir() and p.suffix == ".app":
+            self._install_bundle(str(p))
+        else:
+            print(f"Unsupported format: {path} (expected .app or .app.zip)")
+            sys.exit(1)
+
+    def _install_bundle(self, app_path: str) -> None:
+        sim_id = self._sim_id()
+        print(f"Installing {app_path}...")
+        if cfg.app_id:
+            run_cmd(["xcrun", "simctl", "uninstall", sim_id, cfg.app_id], timeout=30)
+        code, out, err = run_cmd(["xcrun", "simctl", "install", sim_id, app_path], timeout=60)
+        if code != 0:
+            print(f"Install failed: {err.strip()[:200]}")
+            sys.exit(1)
+        print("Installed.")
+
+    def _required_app_id(self, app_id: str | None = None) -> str:
+        resolved = app_id or cfg.app_id
+        if not resolved:
+            print("No appId provided. Set appId in tether.json or pass one to the command.")
+            sys.exit(1)
+        return resolved
+
+    def launch_app(self, app_id: str | None = None) -> None:
+        sim_id = self._sim_id()
+        resolved_app_id = self._required_app_id(app_id)
+        code, out, err = run_cmd(
+            ["xcrun", "simctl", "launch", sim_id, resolved_app_id],
+            timeout=10,
+        )
+        if code != 0:
+            print(f"Launch failed: {err.strip()[:100]}")
+            sys.exit(1)
+        print("Launched.")
+
+    def close_app(self, app_id: str | None = None) -> None:
+        sim_id = self._sim_id()
+        resolved_app_id = self._required_app_id(app_id)
+        code, out, err = run_cmd(
+            ["xcrun", "simctl", "terminate", sim_id, resolved_app_id],
+            timeout=10,
+        )
+        if code != 0 and "not running" not in err.lower():
+            print(f"Close failed: {(err or out).strip()[:100]}")
+            sys.exit(1)
+        print("Closed.")
+
+    def reset_app(self, app_id: str | None = None) -> None:
+        sim_id = self._sim_id()
+        resolved_app_id = self._required_app_id(app_id)
+        self.close_app(resolved_app_id)
+        code, out, err = run_cmd(
+            ["xcrun", "simctl", "get_app_container", sim_id, resolved_app_id, "data"],
+            timeout=10,
+        )
+        container = Path(out.strip())
+        if code != 0 or not container.exists():
+            print(f"Reset failed: {(err or out).strip()[:100]}")
+            sys.exit(1)
+        for child in container.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+        print("Reset.")
+
+    def open_url(self, url: str) -> None:
+        sim_id = self._sim_id()
+        if cfg.app_id and shutil.which("maestro"):
+            flow_path = Path(tempfile.mkdtemp()) / "open-url.yaml"
+            flow_path.write_text("\n".join([
+                f"appId: {cfg.app_id}",
+                "---",
+                "- launchApp:",
+                "    stopApp: false",
+                f"- openLink: {json.dumps(url)}",
+                "- extendedWaitUntil:",
+                "    visible:",
+                "      text: \"Open\"",
+                "    timeout: 5000",
+                "    optional: true",
+                "- tapOn:",
+                "    text: \"Open\"",
+                "    optional: true",
+            ]) + "\n")
+            args = ["maestro", "--platform=ios"]
+            if sim_id != "booted":
+                args.extend(["--device", sim_id])
+            args.extend(["test", str(flow_path)])
+            code, out, err = run_cmd(args, timeout=60)
+        else:
+            code, out, err = run_cmd(
+                ["xcrun", "simctl", "openurl", sim_id, url],
+                timeout=10,
+            )
+        if code != 0:
+            print(f"Open URL failed: {(err or out).strip()[:100]}")
+            sys.exit(1)
+        print("Opened URL.")
 
     def start_log_collector(self) -> LogcatCollector:
         global _ios_logcat
@@ -774,6 +1038,8 @@ def load_config() -> Config:
             pass
 
     # Env vars override everything
+    if env_platform := os.environ.get("TETHER_PLATFORM"):
+        platform = env_platform
     if env_avd := os.environ.get("TETHER_AVD"):
         avd = env_avd
     if env_home := os.environ.get("ANDROID_HOME"):
@@ -972,6 +1238,227 @@ def check_ui_dump() -> CheckResult:
     if code == 0 and "hierarchy" in out:
         return CheckResult("ui dump", True, "works", ms, critical=False)
     return CheckResult("ui dump", False, "dump failed (non-critical)", ms, critical=False)
+
+
+def check_mitmproxy_installed() -> CheckResult:
+    start = time.perf_counter()
+    path = shutil.which("mitmdump")
+    ms = int((time.perf_counter() - start) * 1000)
+    if path:
+        return CheckResult("mitmproxy installed", True, path, ms, critical=False)
+    return CheckResult("mitmproxy installed", False, "not found (brew install mitmproxy)", ms, critical=False)
+
+
+def check_emulator_proxy(port: int = 8080) -> CheckResult:
+    start = time.perf_counter()
+    code, out, _ = run_cmd(["adb", "shell", "settings", "get", "global", "http_proxy"], timeout=5)
+    ms = int((time.perf_counter() - start) * 1000)
+    if code == 0 and f":{port}" in out:
+        return CheckResult("emulator proxy", True, out.strip(), ms, critical=False)
+    return CheckResult("emulator proxy", False, "not configured (set by tether sniff)", ms, critical=False)
+
+
+def check_mitmproxy_ca() -> CheckResult:
+    start = time.perf_counter()
+    ca_path = Path.home() / ".mitmproxy" / "mitmproxy-ca-cert.cer"
+    ms = int((time.perf_counter() - start) * 1000)
+    if ca_path.exists():
+        return CheckResult("mitmproxy CA cert", True, str(ca_path), ms, critical=False)
+    return CheckResult("mitmproxy CA cert", False, "run mitmdump once to generate", ms, critical=False)
+
+
+# Inline mitmdump addon that serializes request/response pairs to JSON
+_MITM_ADDON_TEMPLATE = textwrap.dedent("""\
+    import json, time
+    from mitmproxy import http
+
+    FILTER_DOMAINS = {filter_domains!r}
+    OUTPUT_FILE = {output_file!r}
+
+    def _redact(val: str) -> str:
+        if len(val) <= 10:
+            return val
+        return val[:10] + "...redacted"
+
+    def _matches_filter(host: str) -> bool:
+        if not FILTER_DOMAINS:
+            return True
+        for d in FILTER_DOMAINS:
+            if d in host:
+                return True
+        return False
+
+    class TetherAddon:
+        def __init__(self):
+            self._start_times: dict[int, float] = {{}}
+
+        def request(self, flow: http.HTTPFlow) -> None:
+            self._start_times[id(flow)] = time.time()
+
+        def response(self, flow: http.HTTPFlow) -> None:
+            if not _matches_filter(flow.request.host):
+                return
+            start_ts = self._start_times.pop(id(flow), time.time())
+            duration_ms = int((time.time() - start_ts) * 1000)
+            req_headers = dict(flow.request.headers)
+            for key in ("authorization", "cookie"):
+                if key in req_headers:
+                    req_headers[key] = _redact(req_headers[key])
+                cap = key.capitalize()
+                if cap in req_headers:
+                    req_headers[cap] = _redact(req_headers[cap])
+
+            req_body = None
+            if flow.request.content:
+                try:
+                    req_body = json.loads(flow.request.content)
+                except Exception:
+                    req_body = flow.request.content.decode("utf-8", errors="replace")[:500]
+
+            resp_body = None
+            if flow.response and flow.response.content:
+                try:
+                    resp_body = json.loads(flow.response.content)
+                except Exception:
+                    resp_body = flow.response.content.decode("utf-8", errors="replace")[:500]
+
+            entry = {{
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "method": flow.request.method,
+                "url": flow.request.pretty_url,
+                "request_headers": req_headers,
+                "request_body": req_body,
+                "status_code": flow.response.status_code if flow.response else None,
+                "response_headers": dict(flow.response.headers) if flow.response else {{}},
+                "response_body": resp_body,
+                "duration_ms": duration_ms,
+            }}
+
+            with open(OUTPUT_FILE, "a") as f:
+                f.write(json.dumps(entry) + "\\n")
+
+    addons = [TetherAddon()]
+""")
+
+
+def _redact_header(val: str) -> str:
+    if len(val) <= 10:
+        return val
+    return val[:10] + "...redacted"
+
+
+def redact_sniff_entry(entry: dict) -> dict:
+    """Redact sensitive headers in a parsed sniff entry."""
+    result = dict(entry)
+    hdrs = result.get("request_headers")
+    if isinstance(hdrs, dict):
+        hdrs = dict(hdrs)
+        for key in list(hdrs.keys()):
+            if key.lower() in ("authorization", "cookie"):
+                hdrs[key] = _redact_header(hdrs[key])
+        result["request_headers"] = hdrs
+    return result
+
+
+def parse_sniff_output(path: str | Path) -> list[dict]:
+    """Read a newline-delimited JSON capture file, return list of entries."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    entries = []
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return entries
+
+
+class SniffCapture:
+    """Manages a mitmdump capture session."""
+
+    def __init__(self, filter_domains: list[str] | None = None, port: int = 8080):
+        self.filter_domains = filter_domains or []
+        self.port = port
+        self._proc: subprocess.Popen | None = None
+        self._addon_path: str | None = None
+        self._output_path: str | None = None
+        self._proxy_was_set = False
+
+    def _write_addon(self, output_file: str) -> str:
+        fd, path = tempfile.mkstemp(suffix=".py", prefix="tether_sniff_")
+        content = _MITM_ADDON_TEMPLATE.format(
+            filter_domains=self.filter_domains,
+            output_file=output_file,
+        )
+        os.write(fd, content.encode())
+        os.close(fd)
+        return path
+
+    def _set_proxy(self) -> None:
+        code, _, _ = run_cmd(
+            ["adb", "shell", "settings", "put", "global", "http_proxy", f"10.0.2.2:{self.port}"],
+            timeout=5,
+        )
+        if code == 0:
+            self._proxy_was_set = True
+
+    def _clear_proxy(self) -> None:
+        run_cmd(["adb", "shell", "settings", "put", "global", "http_proxy", ":0"], timeout=5)
+
+    def start(self) -> str:
+        CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        output_file = str(CAPTURES_DIR / f"capture-{ts}.ndjson")
+        self._output_path = output_file
+        self._addon_path = self._write_addon(output_file)
+
+        self._set_proxy()
+
+        try:
+            self._proc = subprocess.Popen(
+                ["mitmdump", "-p", str(self.port), "-s", self._addon_path, "--set", "stream_large_bodies=1"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            time.sleep(1)
+            if self._proc.poll() is not None:
+                _, stderr = self._proc.communicate(timeout=5)
+                raise RuntimeError(f"mitmdump failed to start: {stderr.decode()[:200]}")
+        except Exception:
+            if self._proxy_was_set:
+                self._clear_proxy()
+            if self._addon_path and os.path.exists(self._addon_path):
+                os.unlink(self._addon_path)
+            raise
+
+        return output_file
+
+    def stop(self) -> list[dict]:
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait(timeout=3)
+
+        if self._proxy_was_set:
+            self._clear_proxy()
+
+        if self._addon_path and os.path.exists(self._addon_path):
+            os.unlink(self._addon_path)
+
+        entries = parse_sniff_output(self._output_path) if self._output_path else []
+
+        if entries and self._output_path:
+            import shutil as _sh
+            _sh.copy2(self._output_path, str(SNIFF_LAST))
+
+        return entries
 
 
 # === Commands ===
@@ -1187,19 +1674,28 @@ def cmd_elements(as_json: bool = False) -> None:
             print(_format_element_line(el))
 
 
-def cmd_inspect() -> None:
+def cmd_inspect(out_dir: str | None = None) -> None:
     """Screenshot + elements + logs in one call. The primary agent command."""
     check = platform.is_device_running()
     if not check.passed:
         print("Device not running. Run: tether boot")
         sys.exit(1)
 
+    capture_dir = Path(out_dir) if out_dir else None
+    screenshot_path = capture_dir / "screenshot.png" if capture_dir else SCREEN_PATH
+    elements_path = capture_dir / "elements.json" if capture_dir else None
+    logs_path = capture_dir / "logs.json" if capture_dir else None
+    if capture_dir:
+        capture_dir.mkdir(parents=True, exist_ok=True)
+
+    started_at = datetime.now(timezone.utc).isoformat()
     # Start log collector
     lc = platform.start_log_collector()
     time.sleep(0.3)
 
     # Screenshot
-    if not platform.screenshot(SCREEN_PATH):
+    screenshot_ok = platform.screenshot(screenshot_path)
+    if not screenshot_ok:
         print("Screenshot failed", file=sys.stderr)
 
     # Elements
@@ -1211,16 +1707,32 @@ def cmd_inspect() -> None:
     crashes = [e for e in log_entries if e.get("severity") == "crash"]
     errors = [e for e in log_entries if e.get("severity") == "error"]
 
+    if elements_path:
+        elements_path.write_text(json.dumps(elements, indent=2))
+    if logs_path:
+        logs_path.write_text(json.dumps(log_entries, indent=2))
+
     output: dict = {
-        "screenshot": str(SCREEN_PATH),
+        "platform": cfg.platform,
+        "appId": cfg.app_id,
+        "startedAt": started_at,
+        "finishedAt": datetime.now(timezone.utc).isoformat(),
+        "screenshot": str(screenshot_path) if screenshot_ok else "",
+        "screenshotPath": str(screenshot_path) if screenshot_ok else "",
         "elements": elements,
     }
+    if elements_path:
+        output["elementsPath"] = str(elements_path)
+    if logs_path:
+        output["logsPath"] = str(logs_path)
+    if capture_dir:
+        output["outDir"] = str(capture_dir)
     if crashes:
         output["crashes"] = [e["line"] for e in crashes]
     if errors:
         output["errors"] = [e["line"] for e in errors[-10:]]
     if log_entries and not crashes and not errors:
-        output["log_lines"] = len(log_entries)
+        output["logLines"] = len(log_entries)
 
     print(json.dumps(output, indent=2))
 
@@ -1755,6 +2267,394 @@ def cmd_progress_clear() -> None:
         print("No progress to clear.")
 
 
+def cmd_sniff(filter_domains: list[str] | None = None, duration: int = 30,
+              output: str | None = None, last: bool = False) -> None:
+    """Capture HTTP/HTTPS traffic from the emulator via mitmdump."""
+    if last:
+        entries = parse_sniff_output(SNIFF_LAST)
+        if not entries:
+            print("No previous capture found.")
+            sys.exit(1)
+        print(json.dumps(entries, indent=2))
+        return
+
+    if not shutil.which("mitmdump"):
+        print("mitmdump not found. Run: brew install mitmproxy")
+        sys.exit(1)
+
+    if cfg.platform != "android":
+        print("tether sniff is Android-only in v1.")
+        sys.exit(1)
+
+    if not platform.is_device_running():
+        print("Emulator not running. Run: tether boot")
+        sys.exit(1)
+
+    capture = SniffCapture(filter_domains=filter_domains)
+    output_file = capture.start()
+    domains_str = ", ".join(filter_domains) if filter_domains else "all"
+    print(f"Capturing traffic ({domains_str}) for {duration}s...", file=sys.stderr)
+    print(f"Output: {output_file}", file=sys.stderr)
+
+    try:
+        time.sleep(duration)
+    except KeyboardInterrupt:
+        print("\nStopping early...", file=sys.stderr)
+
+    entries = capture.stop()
+
+    if output:
+        Path(output).write_text(json.dumps(entries, indent=2))
+        print(f"Saved {len(entries)} requests to {output}", file=sys.stderr)
+
+    if entries:
+        print(json.dumps(entries, indent=2))
+    else:
+        print("No traffic captured.", file=sys.stderr)
+
+
+def read_audit_events(
+    run_id: str | None = None,
+    surface: str | None = None,
+    name: str | None = None,
+) -> list[dict]:
+    """Read agent audit events collected by active log collectors."""
+    if not AUDIT_FILE.exists():
+        return []
+
+    events = []
+    for line in AUDIT_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if run_id and event.get("runId") != run_id:
+            continue
+        if surface and event.get("surface") != surface:
+            continue
+        if name and event.get("name") != name:
+            continue
+        events.append(event)
+    return events
+
+
+def cmd_audit(
+    run_id: str | None = None,
+    surface: str | None = None,
+    name: str | None = None,
+    clear: bool = False,
+) -> None:
+    """Read agent audit events collected during flow runs."""
+    if clear:
+        AUDIT_FILE.unlink(missing_ok=True)
+        print("Audit log cleared.")
+        return
+
+    print(json.dumps(read_audit_events(run_id, surface, name), indent=2))
+
+
+def _find_artifacts_base() -> Path:
+    """Walk up from cwd to find a likely project artifact directory."""
+    current = Path.cwd()
+    while True:
+        artifacts = current / "artifacts" / "dev-clients"
+        if artifacts.exists():
+            return artifacts
+        if (current / "package.json").exists():
+            return artifacts
+        parent = current.parent
+        if parent == current:
+            return Path.cwd() / "artifacts" / "dev-clients"
+        current = parent
+
+
+def cmd_install(path: str | None = None) -> None:
+    """Install app binary onto the running device/simulator.
+
+    Platform is inferred from the file extension (.apk → android, .zip/.app → ios)
+    when a path is provided; otherwise falls back to config platform.
+    """
+    global platform, cfg
+
+    if not path:
+        base = _find_artifacts_base()
+        if cfg.platform == "ios":
+            candidates = [*sorted((base / "ios").glob("*.app.zip")), *sorted((base / "ios").glob("*.app"))]
+        else:
+            candidates = sorted((base / "android").glob("*.apk"))
+        for c in candidates:
+            if c.exists():
+                path = str(c)
+                break
+        if not path:
+            print(f"No binary found under {base}. Pass a path to .apk, .app.zip, or .app.")
+            sys.exit(1)
+
+    # Auto-detect platform from extension so callers don't need to set tether.json
+    ext = Path(path).suffix.lower()
+    if ext == ".apk" and cfg.platform != "android":
+        cfg = Config(
+            platform="android", avd=cfg.avd, app_id=cfg.app_id,
+            android_home=cfg.android_home, emulator_bin=cfg.emulator_bin,
+            simulator=cfg.simulator, timeout_boot=cfg.timeout_boot,
+            timeout_flow=cfg.timeout_flow, timeout_screenshot=cfg.timeout_screenshot,
+        )
+        platform = AndroidPlatform()
+    elif ext in (".zip", ".app") and cfg.platform != "ios":
+        cfg = Config(
+            platform="ios", avd=cfg.avd, app_id=cfg.app_id,
+            android_home=cfg.android_home, emulator_bin=cfg.emulator_bin,
+            simulator=cfg.simulator, timeout_boot=cfg.timeout_boot,
+            timeout_flow=cfg.timeout_flow, timeout_screenshot=cfg.timeout_screenshot,
+        )
+        platform = IOSPlatform()
+
+    check = platform.is_device_running()
+    if not check.passed:
+        print("Device not running. Run: tether boot")
+        sys.exit(1)
+
+    platform.install_app(path)
+
+
+def cmd_launch(app_id: str | None = None) -> None:
+    """Launch the installed app on the running device/simulator."""
+    check = platform.is_device_running()
+    if not check.passed:
+        print("Device not running. Run: tether boot")
+        sys.exit(1)
+    platform.launch_app(app_id)
+
+
+def cmd_close(app_id: str | None = None) -> None:
+    """Stop the app on the running device/simulator."""
+    check = platform.is_device_running()
+    if not check.passed:
+        print("Device not running. Run: tether boot")
+        sys.exit(1)
+    platform.close_app(app_id)
+
+
+def cmd_reset(app_id: str | None = None) -> None:
+    """Reset app state on the running device/simulator."""
+    check = platform.is_device_running()
+    if not check.passed:
+        print("Device not running. Run: tether boot")
+        sys.exit(1)
+    platform.reset_app(app_id)
+
+
+def _maestro_tap_flow_yaml(selector: dict[str, str]) -> str:
+    lines = []
+    if cfg.app_id:
+        lines.extend([
+            f"appId: {cfg.app_id}",
+            "---",
+        ])
+    lines.append("- tapOn:")
+    if "text" in selector:
+        lines.append(f"    text: {json.dumps(selector['text'])}")
+    elif "id" in selector:
+        lines.append(f"    id: {json.dumps(selector['id'])}")
+    elif "point" in selector:
+        lines.append(f"    point: {json.dumps(selector['point'])}")
+    else:
+        raise ValueError("tap selector must include text, id, or point")
+    return "\n".join(lines) + "\n"
+
+
+def _element_center_point(element: dict) -> str | None:
+    bounds = element.get("bounds")
+    if isinstance(bounds, str):
+        parsed = _parse_bounds(bounds)
+        if parsed:
+            x1, y1, x2, y2 = parsed
+            return f"{(x1 + x2) // 2},{(y1 + y2) // 2}"
+    frame = element.get("frame")
+    if isinstance(frame, dict):
+        try:
+            x = int(float(frame.get("x", 0)) + float(frame.get("width", 0)) / 2)
+            y = int(float(frame.get("y", 0)) + float(frame.get("height", 0)) / 2)
+            return f"{x},{y}"
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _tap_selector_from_ref(ref: str) -> dict[str, str]:
+    raw = platform.dump_elements_raw()
+    elements = platform.parse_elements(raw, assign_refs=True)
+    match = next((element for element in elements if element.get("ref") == ref), None)
+    if not match:
+        raise ValueError(f"No element found for ref {ref}")
+    element_id = match.get("id") or match.get("identifier") or match.get("resourceId")
+    if element_id:
+        return {"id": str(element_id)}
+    text = match.get("text") or match.get("label") or match.get("name")
+    if text:
+        return {"text": str(text)}
+    point = _element_center_point(match)
+    if point:
+        return {"point": point}
+    raise ValueError(f"Element {ref} has no tappable text, id, or point")
+
+
+def cmd_tap(
+    text: str | None = None,
+    element_id: str | None = None,
+    ref: str | None = None,
+    point: str | None = None,
+) -> None:
+    """Tap a visible element using a generated Maestro flow."""
+    selectors = [value for value in (text, element_id, ref, point) if value]
+    if len(selectors) != 1:
+        print("Usage: tether tap --text <text> | --id <id> | --ref <@ref> | --point x,y")
+        sys.exit(1)
+
+    check = platform.is_device_running()
+    if not check.passed:
+        print("Device not running. Run: tether boot")
+        sys.exit(1)
+
+    try:
+        if text:
+            selector = {"text": text}
+        elif element_id:
+            selector = {"id": element_id}
+        elif ref:
+            selector = _tap_selector_from_ref(ref)
+        else:
+            if not re.match(r"^\d+,\d+$", point or ""):
+                raise ValueError("--point must be x,y")
+            selector = {"point": point or ""}
+    except ValueError as exc:
+        print(str(exc))
+        sys.exit(1)
+
+    flow_path = Path(tempfile.mkdtemp()) / "tap.yaml"
+    flow_path.write_text(_maestro_tap_flow_yaml(selector))
+    code, out, err = run_cmd(
+        ["maestro", "test", "-p", cfg.platform, str(flow_path)],
+        timeout=cfg.timeout_flow,
+    )
+    if code != 0:
+        print(f"Tap failed: {(err or out).strip()[:200]}")
+        sys.exit(1)
+    print("Tapped.")
+
+
+def cmd_open_url(
+    url: str,
+    audit_run_id: str | None = None,
+    json_output: bool = False,
+) -> None:
+    """Open a URL or deep link on the running device/simulator."""
+    check = platform.is_device_running()
+    if not check.passed:
+        if json_output:
+            print(json.dumps({
+                "opened": False,
+                "error": "Device not running. Run: tether boot",
+                "auditEvents": [],
+                "logsPath": "",
+            }, indent=2))
+        else:
+            print("Device not running. Run: tether boot")
+        sys.exit(1)
+
+    collector = platform.start_log_collector() if audit_run_id else None
+    if collector:
+        time.sleep(0.3)
+
+    opened = False
+    error = ""
+    captured_stdout = io.StringIO()
+    try:
+        if json_output:
+            with contextlib.redirect_stdout(captured_stdout):
+                platform.open_url(url)
+        else:
+            platform.open_url(url)
+        opened = True
+    except SystemExit as exc:
+        error = captured_stdout.getvalue().strip() or f"open-url failed with exit {exc.code}"
+        if not json_output:
+            raise
+
+    logs_path = ""
+    audit_events: list[dict] = []
+    if collector:
+        time.sleep(0.8)
+        log_entries = collector.drain()
+        logs_path = str(Path(tempfile.mkdtemp(prefix="tether-open-url-")) / "logs.json")
+        Path(logs_path).write_text(json.dumps(log_entries, indent=2))
+        audit_events = read_audit_events(run_id=audit_run_id)
+
+    if json_output:
+        print(json.dumps({
+            "opened": opened,
+            "url": url,
+            "auditRunId": audit_run_id or "",
+            "auditEvents": audit_events,
+            "logsPath": logs_path,
+            "message": captured_stdout.getvalue().strip(),
+            "error": error,
+        }, indent=2))
+        if not opened:
+            sys.exit(1)
+
+
+def cmd_expo(port: int = 8081) -> None:
+    """Ensure the Expo dev server is running. Starts it if needed."""
+    import urllib.request
+    import urllib.error
+
+    url = f"http://localhost:{port}/status"
+
+    def check_expo() -> bool:
+        try:
+            with urllib.request.urlopen(url, timeout=1) as r:
+                body = r.read().decode("utf-8", errors="replace").strip()
+                return r.status == 200 and body == "packager-status:running"
+        except Exception:
+            return False
+
+    if check_expo():
+        print(f"Expo already running on port {port}.")
+        return
+
+    # Find repo root (dir containing package.json)
+    repo_root = Path.cwd()
+    for candidate in [Path.cwd(), *Path.cwd().parents]:
+        if (candidate / "package.json").exists():
+            repo_root = candidate
+            break
+
+    print(f"Starting Expo on port {port}...")
+    import subprocess as _sp
+    proc = _sp.Popen(
+        ["npx", "expo", "start", "--port", str(port), "--non-interactive"],
+        cwd=str(repo_root),
+        stdout=_sp.DEVNULL,
+        stderr=_sp.DEVNULL,
+        start_new_session=True,
+    )
+    # proc is detached; we just poll the HTTP endpoint
+
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        if check_expo():
+            print("Expo running.")
+            return
+        time.sleep(2)
+
+    print("Expo failed to start in 90s. Run manually: npx expo start")
+    sys.exit(1)
+
+
 COMMAND_HELP = {
     "doctor": """
 tether doctor [--fix]
@@ -1787,6 +2687,32 @@ tether boot
 Start the emulator if not already running.
 Waits up to 90s for boot to complete.
 """,
+    "launch": """
+tether launch [appId]
+
+Launch the configured app, or the provided app id, on the running device/simulator.
+""",
+    "close": """
+tether close [appId]
+
+Stop the configured app, or the provided app id, on the running device/simulator.
+""",
+    "reset": """
+tether reset [appId]
+
+Reset app state for the configured app, or the provided app id, on the running device/simulator.
+Android uses pm clear. iOS clears the app data container while keeping the app installed.
+""",
+    "open-url": """
+tether open-url <url> [--audit-run-id <id>] [--json]
+
+Open a URL or deep link on the running device/simulator.
+The URL is generic. Project-specific code should build app-specific schemes itself.
+
+Options:
+  --audit-run-id <id>  Collect [agent-audit] events for this run while opening.
+  --json              Print machine-readable opened/audit/logs result.
+""",
     "screen": """
 tether screen [path]
 
@@ -1812,6 +2738,15 @@ Output:
   that can be used as Maestro selectors.
 
 Note: May timeout on some Android versions. Use 'screen' as fallback.
+""",
+    "tap": """
+tether tap --text <text>
+tether tap --id <id>
+tether tap --ref <@ref>
+tether tap --point x,y
+
+Tap a visible element through a short generated Maestro flow.
+Prefer --text, --id, or --ref. Coordinate taps require explicit --point.
 """,
     "flow": """
 tether flow <file>
@@ -1886,6 +2821,13 @@ Output prefixes:
   ERR  Error/exception
        Info (ReactNativeJS log, etc.)
 """,
+    "inspect": """
+tether inspect [--out <dir>]
+
+Capture screenshot, elements, and recent logs in one JSON output.
+With --out, writes screenshot.png, elements.json, and logs.json to that directory and prints their paths.
+This is the recommended command when inspecting current app state.
+""",
     "watch": """
 tether watch [--timeout N] [--debounce N] [--json]
 
@@ -1913,6 +2855,50 @@ Stdout (--json):
   {"timestamp":"...","event_type":"...","elements_count":42,"snapshot_number":3}
 
 Diagnostics print to stderr. Ctrl+C to stop.
+""",
+    "audit": """
+tether audit [--runId <id>] [--surface <surface>] [--name <name>] [--clear]
+
+Read agent audit events written during flow runs.
+
+Events are collected automatically from [agent-audit] log lines whenever
+a log collector is running (tether flow, tether watch, tether logcat --follow).
+
+Options:
+  --runId <id>       Filter by agent run ID
+  --surface <name>   Filter by surface (mixpanel, sentry, adjust, logger, etc.)
+  --name <name>      Filter by event name (track, error, identify, etc.)
+  --clear            Delete the audit log
+
+Output:
+  JSON array of matching audit events.
+
+File: /tmp/tether-audit.jsonl
+""",
+    "sniff": """
+tether sniff [--filter <domains>] [--duration <secs>] [--output <path>]
+tether sniff --last
+
+Capture HTTP/HTTPS traffic from the Android emulator via mitmdump.
+
+Options:
+  --filter <domains>   Comma-separated domain substrings (e.g. purchasely,googleapis)
+  --duration <secs>    Capture duration in seconds (default: 30)
+  --output <path>      Also save JSON to this path
+  --last               Re-read the most recent capture
+
+Output:
+  JSON array of request/response pairs to stdout.
+  Each entry includes method, url, headers, body, status_code, duration_ms.
+  Authorization and Cookie headers are redacted.
+
+Prerequisites:
+  brew install mitmproxy
+  Rooted emulator image (Google APIs, not Google Play)
+
+Captures stored in: ~/.tether/captures/
+
+Note: Android-only in v1. Sets emulator proxy on start, clears on stop.
 """,
 }
 
@@ -1950,6 +2936,72 @@ def main() -> None:
         cmd_status()
     elif cmd == "boot":
         cmd_boot()
+    elif cmd == "install":
+        install_path = next((a for a in args[1:] if not a.startswith("-")), None)
+        cmd_install(install_path)
+    elif cmd == "launch":
+        launch_app_id = next((a for a in args[1:] if not a.startswith("-")), None)
+        cmd_launch(launch_app_id)
+    elif cmd == "close":
+        close_app_id = next((a for a in args[1:] if not a.startswith("-")), None)
+        cmd_close(close_app_id)
+    elif cmd == "reset":
+        reset_app_id = next((a for a in args[1:] if not a.startswith("-")), None)
+        cmd_reset(reset_app_id)
+    elif cmd in ("open-url", "openlink"):
+        audit_run_id = None
+        url = None
+        skip_next = False
+        for i, a in enumerate(args[1:], start=1):
+            if skip_next:
+                skip_next = False
+                continue
+            if a == "--audit-run-id" and i + 1 < len(args):
+                audit_run_id = args[i + 1]
+                skip_next = True
+            elif a.startswith("--audit-run-id="):
+                audit_run_id = a.split("=", 1)[1]
+            elif a.startswith("-"):
+                continue
+            elif url is None:
+                url = a
+        if not url:
+            print("Usage: tether open-url <url> [--audit-run-id <id>] [--json]")
+            sys.exit(1)
+        cmd_open_url(url, audit_run_id=audit_run_id, json_output="--json" in args)
+    elif cmd == "tap":
+        tap_text = None
+        tap_id = None
+        tap_ref = None
+        tap_point = None
+        for i, a in enumerate(args[1:], start=1):
+            if a == "--text" and i + 1 < len(args):
+                tap_text = args[i + 1]
+            elif a.startswith("--text="):
+                tap_text = a.split("=", 1)[1]
+            elif a == "--id" and i + 1 < len(args):
+                tap_id = args[i + 1]
+            elif a.startswith("--id="):
+                tap_id = a.split("=", 1)[1]
+            elif a == "--ref" and i + 1 < len(args):
+                tap_ref = args[i + 1]
+            elif a.startswith("--ref="):
+                tap_ref = a.split("=", 1)[1]
+            elif a == "--point" and i + 1 < len(args):
+                tap_point = args[i + 1]
+            elif a.startswith("--point="):
+                tap_point = a.split("=", 1)[1]
+        cmd_tap(text=tap_text, element_id=tap_id, ref=tap_ref, point=tap_point)
+    elif cmd == "expo":
+        expo_port = 8081
+        for i, a in enumerate(args):
+            if a == "--port" and i + 1 < len(args):
+                try:
+                    expo_port = int(args[i + 1])
+                except ValueError:
+                    print("--port requires a number")
+                    sys.exit(1)
+        cmd_expo(expo_port)
     elif cmd == "screen":
         output = args[1] if len(args) > 1 and not args[1].startswith("-") else None
         cmd_screen(output)
@@ -1979,7 +3031,11 @@ def main() -> None:
     elif cmd == "last-error":
         cmd_last_error()
     elif cmd == "inspect":
-        cmd_inspect()
+        inspect_out = None
+        for i, a in enumerate(args):
+            if a == "--out" and i + 1 < len(args):
+                inspect_out = args[i + 1]
+        cmd_inspect(inspect_out)
     elif cmd == "logcat":
         lc_follow = "--follow" in args
         lc_lines = 50
@@ -2012,6 +3068,41 @@ def main() -> None:
             cmd_watch(w_timeout, w_debounce, w_json)
         except KeyboardInterrupt:
             print("\nstopped", file=sys.stderr)
+    elif cmd == "audit":
+        a_run_id = None
+        a_surface = None
+        a_name = None
+        a_clear = "--clear" in args
+        for i, a in enumerate(args):
+            if a == "--runId" and i + 1 < len(args):
+                a_run_id = args[i + 1]
+            if a == "--surface" and i + 1 < len(args):
+                a_surface = args[i + 1]
+            if a == "--name" and i + 1 < len(args):
+                a_name = args[i + 1]
+        cmd_audit(run_id=a_run_id, surface=a_surface, name=a_name, clear=a_clear)
+    elif cmd == "sniff":
+        if "--last" in args:
+            cmd_sniff(last=True)
+        else:
+            s_filter = None
+            s_duration = 30
+            s_output = None
+            for i, a in enumerate(args):
+                if a == "--filter" and i + 1 < len(args):
+                    s_filter = [d.strip() for d in args[i + 1].split(",") if d.strip()]
+                if a == "--duration" and i + 1 < len(args):
+                    try:
+                        s_duration = int(args[i + 1])
+                    except ValueError:
+                        print("--duration requires a number")
+                        sys.exit(1)
+                if a == "--output" and i + 1 < len(args):
+                    s_output = args[i + 1]
+            try:
+                cmd_sniff(filter_domains=s_filter, duration=s_duration, output=s_output)
+            except KeyboardInterrupt:
+                print("\nstopped", file=sys.stderr)
     else:
         print(f"Unknown command: {cmd}")
         print("Run 'tether --help' for usage.")
