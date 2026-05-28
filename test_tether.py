@@ -47,6 +47,11 @@ check_mitmproxy_installed = _ns["check_mitmproxy_installed"]
 check_mitmproxy_ca = _ns["check_mitmproxy_ca"]
 read_audit_events = _ns["read_audit_events"]
 cmd_open_url = _ns["cmd_open_url"]
+AuditConfig = _ns["AuditConfig"]
+AuditHealthcheckConfig = _ns["AuditHealthcheckConfig"]
+_audit_transport_summary = _ns["_audit_transport_summary"]
+_audit_file_for_run = _ns["_audit_file_for_run"]
+LogcatCollector = _ns["LogcatCollector"]
 _maestro_tap_flow_yaml = _ns["_maestro_tap_flow_yaml"]
 _element_center_point = _ns["_element_center_point"]
 
@@ -502,14 +507,12 @@ class TestAndroidLaunch(unittest.TestCase):
             return (0, "", "")
 
         with patch.dict(p.open_url.__globals__, {"run_cmd": fake_run_cmd}):
-            p.open_url("example://path?x=1")
+            p.open_url("example://path?x=1&y=2")
 
+        self.assertEqual(calls[0][0:2], ["adb", "shell"])
         self.assertEqual(
-            calls[0],
-            [
-                "adb", "shell", "am", "start", "-W", "-a",
-                "android.intent.action.VIEW", "-d", "example://path?x=1",
-            ],
+            calls[0][2],
+            "am start -W -a android.intent.action.VIEW -d 'example://path?x=1&y=2'",
         )
 
 
@@ -887,23 +890,101 @@ class TestMitmAddonTemplate(unittest.TestCase):
 class TestAuditCommands(unittest.TestCase):
 
     def test_read_audit_events_filters_by_run_surface_and_name(self):
-        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
-            f.write(json.dumps({"runId": "run-1", "surface": "navigation", "name": "received"}) + "\n")
-            f.write(json.dumps({"runId": "run-2", "surface": "navigation", "name": "received"}) + "\n")
-            f.write("not-json\n")
-            audit_path = Path(f.name)
-        previous = _ns["AUDIT_FILE"]
-        _ns["AUDIT_FILE"] = audit_path
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_path = Path(tmp) / "audit.jsonl"
+            audit_dir = Path(tmp) / "per-run"
+            audit_path.write_text(
+                json.dumps({"runId": "run-1", "surface": "navigation", "name": "received"}) + "\n" +
+                json.dumps({"runId": "run-2", "surface": "navigation", "name": "received"}) + "\n" +
+                "not-json\n"
+            )
+            previous_audit = _ns["AUDIT_FILE"]
+            previous_dir = _ns["AUDIT_DIR"]
+            previous_cfg = _ns.get("cfg")
+            _ns["AUDIT_FILE"] = audit_path
+            _ns["AUDIT_DIR"] = audit_dir
+            _ns["cfg"] = None
+            try:
+                self.assertEqual(
+                    read_audit_events(run_id="run-1", surface="navigation", name="received"),
+                    [{"runId": "run-1", "surface": "navigation", "name": "received"}],
+                )
+            finally:
+                _ns["AUDIT_FILE"] = previous_audit
+                _ns["AUDIT_DIR"] = previous_dir
+                _ns["cfg"] = previous_cfg
+
+    def test_audit_transport_summary_uses_configured_healthcheck(self):
+        previous_cfg = _ns.get("cfg")
+        _ns["cfg"] = Config(
+            platform="ios",
+            avd="",
+            app_id="app",
+            android_home="",
+            emulator_bin="",
+            simulator="booted",
+            timeout_boot=1,
+            timeout_flow=1,
+            timeout_screenshot=1,
+            audit=AuditConfig(
+                healthcheck=AuditHealthcheckConfig(
+                    surface="audit",
+                    name="healthcheck",
+                    required=True,
+                ),
+            ),
+        )
         try:
             self.assertEqual(
-                read_audit_events(run_id="run-1", surface="navigation", name="received"),
-                [{"runId": "run-1", "surface": "navigation", "name": "received"}],
+                _audit_transport_summary([])["auditTransport"],
+                "blocked",
+            )
+            self.assertEqual(
+                _audit_transport_summary([
+                    {"runId": "run-1", "surface": "audit", "name": "healthcheck"}
+                ])["auditTransport"],
+                "passed",
             )
         finally:
-            _ns["AUDIT_FILE"] = previous
-            audit_path.unlink(missing_ok=True)
+            _ns["cfg"] = previous_cfg
 
-    def test_open_url_json_collects_audit_events_and_logs(self):
+    def test_collector_uses_configured_audit_prefix_and_run_id_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_path = Path(tmp) / "audit.jsonl"
+            audit_dir = Path(tmp) / "per-run"
+            previous_audit = _ns["AUDIT_FILE"]
+            previous_dir = _ns["AUDIT_DIR"]
+            previous_cfg = _ns.get("cfg")
+            _ns["AUDIT_FILE"] = audit_path
+            _ns["AUDIT_DIR"] = audit_dir
+            _ns["cfg"] = Config(
+                platform="ios",
+                avd="",
+                app_id="app",
+                android_home="",
+                emulator_bin="",
+                simulator="booted",
+                timeout_boot=1,
+                timeout_flow=1,
+                timeout_screenshot=1,
+                audit=AuditConfig(prefix="[custom-audit]", run_id_field="testRunId"),
+            )
+            try:
+                collector = LogcatCollector()
+                collector._maybe_write_audit(
+                    'log line [custom-audit] {"testRunId":"run/1","surface":"cms","name":"request"}'
+                )
+                self.assertEqual(
+                    read_audit_events(run_id="run/1"),
+                    [{"testRunId": "run/1", "surface": "cms", "name": "request"}],
+                )
+                self.assertTrue(_audit_file_for_run("run/1").exists())
+            finally:
+                _ns["AUDIT_FILE"] = previous_audit
+                _ns["AUDIT_DIR"] = previous_dir
+                _ns["cfg"] = previous_cfg
+
+    def test_open_url_json_collects_audit_events_logs_and_healthcheck(self):
         class FakeCollector:
             def drain(self):
                 return [{"line": "log", "severity": "info"}]
@@ -918,25 +999,53 @@ class TestAuditCommands(unittest.TestCase):
             def open_url(self, url):
                 print(f"opened {url}")
 
-        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
-            f.write(json.dumps({"runId": "run-1", "surface": "navigation", "name": "agentScreen.received"}) + "\n")
-            audit_path = Path(f.name)
-        previous_platform = _ns.get("platform")
-        previous_audit = _ns["AUDIT_FILE"]
-        _ns["platform"] = FakePlatform()
-        _ns["AUDIT_FILE"] = audit_path
-        try:
-            with patch("sys.stdout", new_callable=io.StringIO) as stdout:
-                cmd_open_url("app://test", audit_run_id="run-1", json_output=True)
-            output = json.loads(stdout.getvalue())
-            self.assertTrue(output["opened"])
-            self.assertEqual(output["message"], "opened app://test")
-            self.assertEqual(output["auditEvents"][0]["runId"], "run-1")
-            self.assertTrue(Path(output["logsPath"]).exists())
-        finally:
-            _ns["platform"] = previous_platform
-            _ns["AUDIT_FILE"] = previous_audit
-            audit_path.unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_path = Path(tmp) / "audit.jsonl"
+            audit_dir = Path(tmp) / "per-run"
+            audit_path.write_text(
+                json.dumps({"runId": "run-1", "surface": "agentAudit", "name": "agentAudit.healthcheck"}) + "\n" +
+                json.dumps({"runId": "run-1", "surface": "navigation", "name": "agentScreen.received"}) + "\n"
+            )
+            previous_platform = _ns.get("platform")
+            previous_audit = _ns["AUDIT_FILE"]
+            previous_dir = _ns["AUDIT_DIR"]
+            previous_cfg = _ns.get("cfg")
+            _ns["platform"] = FakePlatform()
+            _ns["AUDIT_FILE"] = audit_path
+            _ns["AUDIT_DIR"] = audit_dir
+            _ns["cfg"] = Config(
+                platform="ios",
+                avd="",
+                app_id="app",
+                android_home="",
+                emulator_bin="",
+                simulator="booted",
+                timeout_boot=1,
+                timeout_flow=1,
+                timeout_screenshot=1,
+                audit=AuditConfig(
+                    healthcheck=AuditHealthcheckConfig(
+                        surface="agentAudit",
+                        name="agentAudit.healthcheck",
+                        required=True,
+                    ),
+                ),
+            )
+            try:
+                with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                    cmd_open_url("app://test", audit_run_id="run-1", json_output=True)
+                output = json.loads(stdout.getvalue())
+                self.assertTrue(output["opened"])
+                self.assertEqual(output["message"], "opened app://test")
+                self.assertEqual(output["auditEvents"][0]["runId"], "run-1")
+                self.assertEqual(output["auditTransport"], "passed")
+                self.assertTrue(output["healthcheckObserved"])
+                self.assertTrue(Path(output["logsPath"]).exists())
+            finally:
+                _ns["platform"] = previous_platform
+                _ns["AUDIT_FILE"] = previous_audit
+                _ns["AUDIT_DIR"] = previous_dir
+                _ns["cfg"] = previous_cfg
 
 
 class TestSniffDoctorChecks(unittest.TestCase):

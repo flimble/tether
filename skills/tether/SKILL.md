@@ -17,7 +17,7 @@ tether install [path]       # Install app binary
 tether launch [appId]       # Launch configured or explicit app
 tether close [appId]        # Stop configured or explicit app
 tether open-url <url>       # Open URL or deep link
-tether open-url <url> --audit-run-id <id> --json  # Open URL and collect matching [agent-audit] events
+tether open-url <url> --audit-run-id <id> --json  # Open URL and collect audit evidence
 tether screen [path]        # Take screenshot (agent can view)
 tether elements             # Dump visible UI elements with @refs
 tether elements --json      # Machine-readable element dump
@@ -28,7 +28,18 @@ tether progress [--clear]   # Show flow pass/fail history
 tether last-error           # What failed last time
 tether logcat [--follow]    # Filtered device logs
 tether watch                # Auto-capture on UI changes
+tether audit                # Read agent audit events
+tether audit --runId <id>   # Filter audit events by agent run ID
+tether audit --clear        # Clear the audit log
 ```
+
+## Agent audit events
+
+Apps can emit structured audit log lines with a project-configured prefix. The default prefix is `[agent-audit]` and the default run ID field is `runId`.
+
+Use `tether open-url <url> --audit-run-id <id> --json` when deep-link transport and audit collection must be checked together. JSON output includes `auditEvents`, `auditTransport`, and `healthcheckObserved` when the project config defines a required healthcheck.
+
+If `auditTransport` is `blocked`, do not treat missing target events as app behavior. First fix the sink or healthcheck path.
 
 ## Config (tether.json)
 
@@ -44,7 +55,16 @@ tether watch                # Auto-capture on UI changes
       "critical": ["auth/login", "checkout/payment"]
     }
   },
-  "timeouts": { "boot": 90, "flow": 180, "screenshot": 10 }
+  "timeouts": { "boot": 90, "flow": 180, "screenshot": 10 },
+  "audit": {
+    "prefix": "[agent-audit]",
+    "runIdField": "runId",
+    "healthcheck": {
+      "surface": "agentAudit",
+      "name": "agentAudit.healthcheck",
+      "required": true
+    }
+  }
 }
 ```
 

@@ -65,6 +65,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -86,8 +87,10 @@ WATCH_ELEMENTS = Path("/tmp/tether-elements.json")
 CAPTURES_DIR = Path.home() / ".tether" / "captures"
 SNIFF_LAST = CAPTURES_DIR / "last.json"
 AUDIT_FILE = Path("/tmp/tether-audit.jsonl")
+AUDIT_DIR = Path("/tmp/tether-audit")
 
-_AUDIT_PREFIX = "[agent-audit]"
+_DEFAULT_AUDIT_PREFIX = "[agent-audit]"
+_DEFAULT_AUDIT_RUN_ID_FIELD = "runId"
 
 # Hardcoded defaults
 _DEFAULTS = {
@@ -104,6 +107,20 @@ _DEFAULTS = {
 
 
 @dataclass
+class AuditHealthcheckConfig:
+    surface: str = ""
+    name: str = ""
+    required: bool = False
+
+
+@dataclass
+class AuditConfig:
+    prefix: str = _DEFAULT_AUDIT_PREFIX
+    run_id_field: str = _DEFAULT_AUDIT_RUN_ID_FIELD
+    healthcheck: AuditHealthcheckConfig = field(default_factory=AuditHealthcheckConfig)
+
+
+@dataclass
 class Config:
     platform: str
     avd: str
@@ -114,6 +131,7 @@ class Config:
     timeout_boot: int
     timeout_flow: int
     timeout_screenshot: int
+    audit: AuditConfig = field(default_factory=AuditConfig)
 
     @property
     def default_timeout(self) -> int:
@@ -158,6 +176,47 @@ _LOGCAT_PATTERNS = [
 ]
 
 LOGCAT_FILE = Path("/tmp/tether-logcat.json")
+
+
+def _audit_config() -> AuditConfig:
+    return cfg.audit if cfg is not None else AuditConfig()
+
+
+def _sanitize_audit_run_id(run_id: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]", "_", run_id)
+    return sanitized or "unknown"
+
+
+def _audit_file_for_run(run_id: str) -> Path:
+    return AUDIT_DIR / f"{_sanitize_audit_run_id(run_id)}.jsonl"
+
+
+def _audit_healthcheck_observed(events: list[dict]) -> bool:
+    healthcheck = _audit_config().healthcheck
+    if not healthcheck.required:
+        return True
+    return any(
+        event.get("surface") == healthcheck.surface and
+        event.get("name") == healthcheck.name
+        for event in events
+    )
+
+
+def _audit_transport_summary(events: list[dict]) -> dict:
+    healthcheck = _audit_config().healthcheck
+    if not healthcheck.required:
+        return {
+            "auditTransport": "unchecked",
+            "healthcheckObserved": False,
+            "diagnostic": "No audit healthcheck configured.",
+        }
+
+    observed = _audit_healthcheck_observed(events)
+    return {
+        "auditTransport": "passed" if observed else "blocked",
+        "healthcheckObserved": observed,
+        "diagnostic": "" if observed else "No configured audit healthcheck event found for runId.",
+    }
 
 
 class LogcatCollector:
@@ -222,14 +281,22 @@ class LogcatCollector:
         return any(p.search(line) for p in _LOGCAT_PATTERNS)
 
     def _maybe_write_audit(self, line: str) -> None:
-        if _AUDIT_PREFIX not in line:
+        audit_config = _audit_config()
+        prefix = audit_config.prefix or _DEFAULT_AUDIT_PREFIX
+        if prefix not in line:
             return
-        idx = line.find(_AUDIT_PREFIX)
-        json_part = line[idx + len(_AUDIT_PREFIX):].strip()
+        idx = line.find(prefix)
+        json_part = line[idx + len(prefix):].strip()
         try:
             event = json.loads(json_part)
+            serialized = json.dumps(event) + "\n"
             with open(AUDIT_FILE, "a") as f:
-                f.write(json.dumps(event) + "\n")
+                f.write(serialized)
+            run_id = event.get(audit_config.run_id_field or _DEFAULT_AUDIT_RUN_ID_FIELD)
+            if isinstance(run_id, str) and run_id:
+                AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+                with open(_audit_file_for_run(run_id), "a") as f:
+                    f.write(serialized)
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -482,8 +549,12 @@ class AndroidPlatform(Platform):
         print("Reset.")
 
     def open_url(self, url: str) -> None:
+        remote_command = " ".join([
+            "am", "start", "-W", "-a", "android.intent.action.VIEW", "-d",
+            shlex.quote(url),
+        ])
         code, out, err = run_cmd(
-            ["adb", "shell", "am", "start", "-W", "-a", "android.intent.action.VIEW", "-d", url],
+            ["adb", "shell", remote_command],
             timeout=10,
         )
         combined = f"{out}\n{err}"
@@ -521,16 +592,20 @@ class IOSLogCollector(LogcatCollector):
         try:
             self._proc = subprocess.Popen(
                 ["xcrun", "simctl", "spawn", self._simulator, "log", "stream",
-                 "--style", "compact", "--predicate",
+                 "--style", "compact", "--level", "info", "--predicate",
+                 f'eventMessage CONTAINS "{_audit_config().prefix}" OR '
                  f'subsystem == "com.apple.UIKit" OR '
                  f'messageType == 21 OR '  # fault/crash
                  f'subsystem CONTAINS "ReactNative" OR '
+                 f'subsystem == "com.facebook.react.log" OR '
                  f'process == "maestro" OR '
                  f'(processImagePath CONTAINS "{self._app_id}" AND messageType >= 16)'
                  if self._app_id else
+                 f'eventMessage CONTAINS "{_audit_config().prefix}" OR '
                  'subsystem == "com.apple.UIKit" OR '
                  'messageType == 21 OR '
                  'subsystem CONTAINS "ReactNative" OR '
+                 'subsystem == "com.facebook.react.log" OR '
                  'process == "maestro"'],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
             )
@@ -1011,6 +1086,7 @@ def load_config() -> Config:
     timeout_boot = _DEFAULTS["timeouts"]["boot"]
     timeout_flow = _DEFAULTS["timeouts"]["flow"]
     timeout_screenshot = _DEFAULTS["timeouts"]["screenshot"]
+    audit = AuditConfig()
 
     # Layer on tether.json if found
     config_path = find_config_file()
@@ -1034,6 +1110,23 @@ def load_config() -> Config:
                 timeout_flow = int(timeouts["flow"])
             if "screenshot" in timeouts:
                 timeout_screenshot = int(timeouts["screenshot"])
+            audit_data = data.get("audit", {})
+            if isinstance(audit_data, dict):
+                healthcheck_data = audit_data.get("healthcheck", {})
+                healthcheck = AuditHealthcheckConfig()
+                if isinstance(healthcheck_data, dict):
+                    healthcheck = AuditHealthcheckConfig(
+                        surface=str(healthcheck_data.get("surface", "")),
+                        name=str(healthcheck_data.get("name", "")),
+                        required=bool(healthcheck_data.get("required", False)),
+                    )
+                audit = AuditConfig(
+                    prefix=str(audit_data.get("prefix", _DEFAULT_AUDIT_PREFIX)),
+                    run_id_field=str(
+                        audit_data.get("runIdField", _DEFAULT_AUDIT_RUN_ID_FIELD)
+                    ),
+                    healthcheck=healthcheck,
+                )
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -1059,6 +1152,7 @@ def load_config() -> Config:
         timeout_boot=timeout_boot,
         timeout_flow=timeout_flow,
         timeout_screenshot=timeout_screenshot,
+        audit=audit,
     )
 
 
@@ -2319,25 +2413,34 @@ def read_audit_events(
     name: str | None = None,
 ) -> list[dict]:
     """Read agent audit events collected by active log collectors."""
-    if not AUDIT_FILE.exists():
-        return []
+    audit_config = _audit_config()
+    run_id_field = audit_config.run_id_field or _DEFAULT_AUDIT_RUN_ID_FIELD
+    paths = []
+    if run_id:
+        paths.append(_audit_file_for_run(run_id))
+    paths.append(AUDIT_FILE)
 
+    seen_lines: set[str] = set()
     events = []
-    for line in AUDIT_FILE.read_text().splitlines():
-        line = line.strip()
-        if not line:
+    for path in paths:
+        if not path.exists():
             continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if run_id and event.get("runId") != run_id:
-            continue
-        if surface and event.get("surface") != surface:
-            continue
-        if name and event.get("name") != name:
-            continue
-        events.append(event)
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line in seen_lines:
+                continue
+            seen_lines.add(line)
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if run_id and event.get(run_id_field) != run_id:
+                continue
+            if surface and event.get("surface") != surface:
+                continue
+            if name and event.get("name") != name:
+                continue
+            events.append(event)
     return events
 
 
@@ -2350,6 +2453,11 @@ def cmd_audit(
     """Read agent audit events collected during flow runs."""
     if clear:
         AUDIT_FILE.unlink(missing_ok=True)
+        if run_id:
+            _audit_file_for_run(run_id).unlink(missing_ok=True)
+        elif AUDIT_DIR.exists():
+            for audit_file in AUDIT_DIR.glob("*.jsonl"):
+                audit_file.unlink(missing_ok=True)
         print("Audit log cleared.")
         return
 
@@ -2401,6 +2509,7 @@ def cmd_install(path: str | None = None) -> None:
             android_home=cfg.android_home, emulator_bin=cfg.emulator_bin,
             simulator=cfg.simulator, timeout_boot=cfg.timeout_boot,
             timeout_flow=cfg.timeout_flow, timeout_screenshot=cfg.timeout_screenshot,
+            audit=cfg.audit,
         )
         platform = AndroidPlatform()
     elif ext in (".zip", ".app") and cfg.platform != "ios":
@@ -2409,6 +2518,7 @@ def cmd_install(path: str | None = None) -> None:
             android_home=cfg.android_home, emulator_bin=cfg.emulator_bin,
             simulator=cfg.simulator, timeout_boot=cfg.timeout_boot,
             timeout_flow=cfg.timeout_flow, timeout_screenshot=cfg.timeout_screenshot,
+            audit=cfg.audit,
         )
         platform = IOSPlatform()
 
@@ -2559,6 +2669,9 @@ def cmd_open_url(
                 "opened": False,
                 "error": "Device not running. Run: tether boot",
                 "auditEvents": [],
+                "auditTransport": "blocked" if audit_run_id else "unavailable",
+                "healthcheckObserved": False,
+                "diagnostic": "Device not running. Run: tether boot",
                 "logsPath": "",
             }, indent=2))
         else:
@@ -2593,12 +2706,19 @@ def cmd_open_url(
         Path(logs_path).write_text(json.dumps(log_entries, indent=2))
         audit_events = read_audit_events(run_id=audit_run_id)
 
+    audit_summary = _audit_transport_summary(audit_events) if audit_run_id else {
+        "auditTransport": "unavailable",
+        "healthcheckObserved": False,
+        "diagnostic": "No audit run id supplied.",
+    }
+
     if json_output:
         print(json.dumps({
             "opened": opened,
             "url": url,
             "auditRunId": audit_run_id or "",
             "auditEvents": audit_events,
+            **audit_summary,
             "logsPath": logs_path,
             "message": captured_stdout.getvalue().strip(),
             "error": error,
@@ -2710,7 +2830,7 @@ Open a URL or deep link on the running device/simulator.
 The URL is generic. Project-specific code should build app-specific schemes itself.
 
 Options:
-  --audit-run-id <id>  Collect [agent-audit] events for this run while opening.
+  --audit-run-id <id>  Collect configured audit events for this run while opening.
   --json              Print machine-readable opened/audit/logs result.
 """,
     "screen": """
@@ -2861,8 +2981,9 @@ tether audit [--runId <id>] [--surface <surface>] [--name <name>] [--clear]
 
 Read agent audit events written during flow runs.
 
-Events are collected automatically from [agent-audit] log lines whenever
-a log collector is running (tether flow, tether watch, tether logcat --follow).
+Events are collected automatically from the configured audit log prefix
+(default: [agent-audit]) whenever a log collector is running (tether flow,
+tether watch, tether logcat --follow).
 
 Options:
   --runId <id>       Filter by agent run ID
@@ -2873,7 +2994,7 @@ Options:
 Output:
   JSON array of matching audit events.
 
-File: /tmp/tether-audit.jsonl
+Files: /tmp/tether-audit/<runId>.jsonl and legacy /tmp/tether-audit.jsonl
 """,
     "sniff": """
 tether sniff [--filter <domains>] [--duration <secs>] [--output <path>]

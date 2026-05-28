@@ -112,7 +112,8 @@ tether flow flows/login.yaml
 | `tether launch [appId]` | Launch the configured app, or an explicit app ID |
 | `tether close [appId]` | Stop the configured app, or an explicit app ID |
 | `tether open-url <url>` | Open a URL or deep link on the running device/simulator |
-| `tether open-url <url> --audit-run-id <id> --json` | Open a URL while collecting matching `[agent-audit]` events and log artifact path |
+| `tether open-url <url> --audit-run-id <id> --json` | Open a URL while collecting matching audit events, transport status, and log artifact path |
+| `tether audit --runId <id>` | Read collected audit events for a run |
 
 ### Visibility
 
@@ -201,6 +202,26 @@ For iOS:
 }
 ```
 
+### Agent audit configuration
+
+Projects can configure the audit sink that `tether open-url <url> --audit-run-id <id> --json` and `tether audit` read from device logs.
+
+```json
+{
+  "audit": {
+    "prefix": "[agent-audit]",
+    "runIdField": "runId",
+    "healthcheck": {
+      "surface": "agentAudit",
+      "name": "agentAudit.healthcheck",
+      "required": true
+    }
+  }
+}
+```
+
+When a healthcheck is required, JSON output includes `auditTransport` and `healthcheckObserved`. Treat `auditTransport: "blocked"` as a harness transport failure, not proof that the target app event is absent.
+
 ### Environment Variables
 
 | Variable | Description | Default |
@@ -275,7 +296,7 @@ For more consistent results, add to your project or global instructions file:
 Use `tether` for mobile e2e test automation. Run `tether --help` for all commands.
 
 Workflow: tether doctor --fix → tether boot → tether inspect → write flow YAML → tether flow <file>
-Use tether install/launch/open-url for generic app setup. Use `tether open-url <url> --audit-run-id <id> --json` when a harness needs deep-link transport plus `[agent-audit]` evidence. Use tether elements for selectors. Use tether inspect for screenshot + elements + logs in one call.
+Use tether install/launch/open-url for generic app setup. Use `tether open-url <url> --audit-run-id <id> --json` when a harness needs deep-link transport plus configured audit evidence. Use `auditTransport` and `healthcheckObserved` to tell transport failures from app behavior. Use tether elements for selectors. Use tether inspect for screenshot + elements + logs in one call.
 ```
 
 ## Acknowledgments
