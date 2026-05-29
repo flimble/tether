@@ -16,35 +16,47 @@ COMMANDS:
     tether tap --text <text>   Tap visible text/id/ref via a generated Maestro flow
     tether expo [--port N]     Ensure Expo dev server is running
     tether screen [path]       Screenshot current screen
-    tether elements [--json]   List visible UI elements (with @refs)
-    tether flow <file>         Run a Maestro flow (with logcat)
+    tether elements [--json]   List visible UI elements with @refs
+    tether inspect             Screenshot + elements + logs (best for agents)
+    tether flow <file>         Run one Maestro flow with logs
     tether smoke <dir>         Run all flows in directory
     tether progress            Show test history
-    tether inspect             Screenshot + elements + logcat (recommended)
-    tether watch               Watch for UI changes, auto-capture
-    tether logcat [--follow]   Show filtered logcat (crashes, errors, RN)
     tether last-error          Show most recent failure
+    tether logcat [--follow]   Show filtered logs (crashes, errors, RN)
+    tether watch               Watch for UI changes, auto-capture
     tether sniff               Capture HTTP traffic via mitmdump (Android)
-    tether audit               Read agent audit events (Sentry, Mixpanel, etc.)
+    tether observability       Read agent observability events
+
+AGENT QUICKSTART:
+    doctor -> boot/status -> launch/open-url -> inspect -> write flow -> flow -> last-error/inspect -> iterate
+
+USE THE RIGHT COMMAND:
+    inspect                    Authoring/debugging baseline: screenshot, elements, logs
+    elements                   Selector discovery before writing flow YAML
+    screen                     Visual evidence only; not enough for assertions
+    flow <file>                Iterate one flow before running smoke
+    open-url --agent-run-id ID Deep link and collect matching observability events
+    observability --runId ID   Read Sentry/Mixpanel/etc. events for a run
+
+AVOID:
+    Debugging from screenshots alone; use inspect or elements.
+    Hand-writing selectors before checking elements.
+    Running smoke while fixing one failing flow.
+    Raw adb/simctl before doctor, status, inspect, or logcat.
 
 EXAMPLES:
-    tether doctor              # First: ensure everything works
-    tether screen              # See what's on screen
-    tether elements            # Find selectors to use
-    tether flow flows/login.yaml   # Run a test
-
-WORKFLOW:
-    1. tether doctor           # Validate environment
-    2. tether screen           # See current app state
-    3. tether elements         # Find element selectors
-    4. Write flow YAML        # Create test file
-    5. tether flow <file>      # Run and iterate
+    tether doctor
+    tether inspect
+    tether elements --json
+    tether open-url myapp://checkout --agent-run-id run-123 --json
+    tether flow flows/login.yaml
+    tether last-error
 
 ENVIRONMENT:
     TETHER_AVD                 Android Virtual Device name
                               Default: Pixel_XL_API_29
     TETHER_SIMULATOR           iOS Simulator UDID or name
-    ANDROID_HOME              Android SDK path
+    ANDROID_HOME               Android SDK path
                               Default: ~/Library/Android/sdk
 
 CONFIG FILE:
@@ -55,7 +67,7 @@ FILES:
     ~/.tether/progress.json    Test history
     /tmp/tether-screen.png     Latest screenshot
     /tmp/tether-failure.png    Screenshot on test failure
-    /tmp/tether-audit.jsonl    Agent audit events (Sentry, Mixpanel, etc.)
+    /tmp/tether-observability.jsonl    Agent observability events
 """
 
 from __future__ import annotations
@@ -86,11 +98,11 @@ WATCH_MANIFEST = Path("/tmp/tether-watch.json")
 WATCH_ELEMENTS = Path("/tmp/tether-elements.json")
 CAPTURES_DIR = Path.home() / ".tether" / "captures"
 SNIFF_LAST = CAPTURES_DIR / "last.json"
-AUDIT_FILE = Path("/tmp/tether-audit.jsonl")
-AUDIT_DIR = Path("/tmp/tether-audit")
+OBSERVABILITY_FILE = Path("/tmp/tether-observability.jsonl")
+OBSERVABILITY_DIR = Path("/tmp/tether-observability")
 
-_DEFAULT_AUDIT_PREFIX = "[agent-audit]"
-_DEFAULT_AUDIT_RUN_ID_FIELD = "runId"
+_DEFAULT_OBSERVABILITY_PREFIX = "[agent-observability]"
+_DEFAULT_OBSERVABILITY_RUN_ID_FIELD = "runId"
 
 # Hardcoded defaults
 _DEFAULTS = {
@@ -107,17 +119,17 @@ _DEFAULTS = {
 
 
 @dataclass
-class AuditHealthcheckConfig:
+class ObservabilityHealthcheckConfig:
     surface: str = ""
     name: str = ""
     required: bool = False
 
 
 @dataclass
-class AuditConfig:
-    prefix: str = _DEFAULT_AUDIT_PREFIX
-    run_id_field: str = _DEFAULT_AUDIT_RUN_ID_FIELD
-    healthcheck: AuditHealthcheckConfig = field(default_factory=AuditHealthcheckConfig)
+class ObservabilityConfig:
+    prefix: str = _DEFAULT_OBSERVABILITY_PREFIX
+    run_id_field: str = _DEFAULT_OBSERVABILITY_RUN_ID_FIELD
+    healthcheck: ObservabilityHealthcheckConfig = field(default_factory=ObservabilityHealthcheckConfig)
 
 
 @dataclass
@@ -131,7 +143,7 @@ class Config:
     timeout_boot: int
     timeout_flow: int
     timeout_screenshot: int
-    audit: AuditConfig = field(default_factory=AuditConfig)
+    observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
 
     @property
     def default_timeout(self) -> int:
@@ -178,21 +190,21 @@ _LOGCAT_PATTERNS = [
 LOGCAT_FILE = Path("/tmp/tether-logcat.json")
 
 
-def _audit_config() -> AuditConfig:
-    return cfg.audit if cfg is not None else AuditConfig()
+def _observability_config() -> ObservabilityConfig:
+    return cfg.observability if cfg is not None else ObservabilityConfig()
 
 
-def _sanitize_audit_run_id(run_id: str) -> str:
+def _sanitize_agent_run_id(run_id: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9._-]", "_", run_id)
     return sanitized or "unknown"
 
 
-def _audit_file_for_run(run_id: str) -> Path:
-    return AUDIT_DIR / f"{_sanitize_audit_run_id(run_id)}.jsonl"
+def _observability_file_for_run(run_id: str) -> Path:
+    return OBSERVABILITY_DIR / f"{_sanitize_agent_run_id(run_id)}.jsonl"
 
 
-def _audit_healthcheck_observed(events: list[dict]) -> bool:
-    healthcheck = _audit_config().healthcheck
+def _observability_healthcheck_observed(events: list[dict]) -> bool:
+    healthcheck = _observability_config().healthcheck
     if not healthcheck.required:
         return True
     return any(
@@ -202,20 +214,20 @@ def _audit_healthcheck_observed(events: list[dict]) -> bool:
     )
 
 
-def _audit_transport_summary(events: list[dict]) -> dict:
-    healthcheck = _audit_config().healthcheck
+def _observability_transport_summary(events: list[dict]) -> dict:
+    healthcheck = _observability_config().healthcheck
     if not healthcheck.required:
         return {
-            "auditTransport": "unchecked",
+            "observabilityTransport": "unchecked",
             "healthcheckObserved": False,
-            "diagnostic": "No audit healthcheck configured.",
+            "diagnostic": "No observability healthcheck configured.",
         }
 
-    observed = _audit_healthcheck_observed(events)
+    observed = _observability_healthcheck_observed(events)
     return {
-        "auditTransport": "passed" if observed else "blocked",
+        "observabilityTransport": "passed" if observed else "blocked",
         "healthcheckObserved": observed,
-        "diagnostic": "" if observed else "No configured audit healthcheck event found for runId.",
+        "diagnostic": "" if observed else "No configured observability healthcheck event found for runId.",
     }
 
 
@@ -256,7 +268,7 @@ class LogcatCollector:
             line = line.rstrip()
             if not line:
                 continue
-            self._maybe_write_audit(line)
+            self._maybe_write_observability(line)
             if not self._matches(line):
                 continue
             entry = {
@@ -280,9 +292,9 @@ class LogcatCollector:
             return True
         return any(p.search(line) for p in _LOGCAT_PATTERNS)
 
-    def _maybe_write_audit(self, line: str) -> None:
-        audit_config = _audit_config()
-        prefix = audit_config.prefix or _DEFAULT_AUDIT_PREFIX
+    def _maybe_write_observability(self, line: str) -> None:
+        observability_config = _observability_config()
+        prefix = observability_config.prefix or _DEFAULT_OBSERVABILITY_PREFIX
         if prefix not in line:
             return
         idx = line.find(prefix)
@@ -290,12 +302,12 @@ class LogcatCollector:
         try:
             event = json.loads(json_part)
             serialized = json.dumps(event) + "\n"
-            with open(AUDIT_FILE, "a") as f:
+            with open(OBSERVABILITY_FILE, "a") as f:
                 f.write(serialized)
-            run_id = event.get(audit_config.run_id_field or _DEFAULT_AUDIT_RUN_ID_FIELD)
+            run_id = event.get(observability_config.run_id_field or _DEFAULT_OBSERVABILITY_RUN_ID_FIELD)
             if isinstance(run_id, str) and run_id:
-                AUDIT_DIR.mkdir(parents=True, exist_ok=True)
-                with open(_audit_file_for_run(run_id), "a") as f:
+                OBSERVABILITY_DIR.mkdir(parents=True, exist_ok=True)
+                with open(_observability_file_for_run(run_id), "a") as f:
                     f.write(serialized)
         except (json.JSONDecodeError, OSError):
             pass
@@ -593,7 +605,7 @@ class IOSLogCollector(LogcatCollector):
             self._proc = subprocess.Popen(
                 ["xcrun", "simctl", "spawn", self._simulator, "log", "stream",
                  "--style", "compact", "--level", "info", "--predicate",
-                 f'eventMessage CONTAINS "{_audit_config().prefix}" OR '
+                 f'eventMessage CONTAINS "{_observability_config().prefix}" OR '
                  f'subsystem == "com.apple.UIKit" OR '
                  f'messageType == 21 OR '  # fault/crash
                  f'subsystem CONTAINS "ReactNative" OR '
@@ -601,7 +613,7 @@ class IOSLogCollector(LogcatCollector):
                  f'process == "maestro" OR '
                  f'(processImagePath CONTAINS "{self._app_id}" AND messageType >= 16)'
                  if self._app_id else
-                 f'eventMessage CONTAINS "{_audit_config().prefix}" OR '
+                 f'eventMessage CONTAINS "{_observability_config().prefix}" OR '
                  'subsystem == "com.apple.UIKit" OR '
                  'messageType == 21 OR '
                  'subsystem CONTAINS "ReactNative" OR '
@@ -625,7 +637,7 @@ class IOSLogCollector(LogcatCollector):
             # Skip the log stream filter confirmation line
             if line.startswith("Filtering the log data"):
                 continue
-            self._maybe_write_audit(line)
+            self._maybe_write_observability(line)
             entry = {"line": line, "ts": time.strftime("%H:%M:%S")}
             if re.search(r"fault|crash|SIGABRT|EXC_BAD_ACCESS", line, re.IGNORECASE):
                 entry["severity"] = "crash"
@@ -858,6 +870,14 @@ class IOSPlatform(Platform):
             sys.exit(1)
         print("Launched.")
 
+    def _terminate_not_running(self, text: str) -> bool:
+        lowered = text.lower()
+        return (
+            "not running" in lowered
+            or "found nothing to terminate" in lowered
+            or "failed to terminate" in lowered and "found nothing to terminate" in lowered
+        )
+
     def close_app(self, app_id: str | None = None) -> None:
         sim_id = self._sim_id()
         resolved_app_id = self._required_app_id(app_id)
@@ -865,8 +885,9 @@ class IOSPlatform(Platform):
             ["xcrun", "simctl", "terminate", sim_id, resolved_app_id],
             timeout=10,
         )
-        if code != 0 and "not running" not in err.lower():
-            print(f"Close failed: {(err or out).strip()[:100]}")
+        output = err or out
+        if code != 0 and not self._terminate_not_running(output):
+            print(f"Close failed: {output.strip()[:100]}")
             sys.exit(1)
         print("Closed.")
 
@@ -1086,7 +1107,7 @@ def load_config() -> Config:
     timeout_boot = _DEFAULTS["timeouts"]["boot"]
     timeout_flow = _DEFAULTS["timeouts"]["flow"]
     timeout_screenshot = _DEFAULTS["timeouts"]["screenshot"]
-    audit = AuditConfig()
+    observability = ObservabilityConfig()
 
     # Layer on tether.json if found
     config_path = find_config_file()
@@ -1110,20 +1131,20 @@ def load_config() -> Config:
                 timeout_flow = int(timeouts["flow"])
             if "screenshot" in timeouts:
                 timeout_screenshot = int(timeouts["screenshot"])
-            audit_data = data.get("audit", {})
-            if isinstance(audit_data, dict):
-                healthcheck_data = audit_data.get("healthcheck", {})
-                healthcheck = AuditHealthcheckConfig()
+            observability_data = data.get("observability", {})
+            if isinstance(observability_data, dict):
+                healthcheck_data = observability_data.get("healthcheck", {})
+                healthcheck = ObservabilityHealthcheckConfig()
                 if isinstance(healthcheck_data, dict):
-                    healthcheck = AuditHealthcheckConfig(
+                    healthcheck = ObservabilityHealthcheckConfig(
                         surface=str(healthcheck_data.get("surface", "")),
                         name=str(healthcheck_data.get("name", "")),
                         required=bool(healthcheck_data.get("required", False)),
                     )
-                audit = AuditConfig(
-                    prefix=str(audit_data.get("prefix", _DEFAULT_AUDIT_PREFIX)),
+                observability = ObservabilityConfig(
+                    prefix=str(observability_data.get("prefix", _DEFAULT_OBSERVABILITY_PREFIX)),
                     run_id_field=str(
-                        audit_data.get("runIdField", _DEFAULT_AUDIT_RUN_ID_FIELD)
+                        observability_data.get("runIdField", _DEFAULT_OBSERVABILITY_RUN_ID_FIELD)
                     ),
                     healthcheck=healthcheck,
                 )
@@ -1152,7 +1173,7 @@ def load_config() -> Config:
         timeout_boot=timeout_boot,
         timeout_flow=timeout_flow,
         timeout_screenshot=timeout_screenshot,
-        audit=audit,
+        observability=observability,
     )
 
 
@@ -2407,18 +2428,18 @@ def cmd_sniff(filter_domains: list[str] | None = None, duration: int = 30,
         print("No traffic captured.", file=sys.stderr)
 
 
-def read_audit_events(
+def read_observability_events(
     run_id: str | None = None,
     surface: str | None = None,
     name: str | None = None,
 ) -> list[dict]:
-    """Read agent audit events collected by active log collectors."""
-    audit_config = _audit_config()
-    run_id_field = audit_config.run_id_field or _DEFAULT_AUDIT_RUN_ID_FIELD
+    """Read agent observability events collected by active log collectors."""
+    observability_config = _observability_config()
+    run_id_field = observability_config.run_id_field or _DEFAULT_OBSERVABILITY_RUN_ID_FIELD
     paths = []
     if run_id:
-        paths.append(_audit_file_for_run(run_id))
-    paths.append(AUDIT_FILE)
+        paths.append(_observability_file_for_run(run_id))
+    paths.append(OBSERVABILITY_FILE)
 
     seen_lines: set[str] = set()
     events = []
@@ -2444,24 +2465,24 @@ def read_audit_events(
     return events
 
 
-def cmd_audit(
+def cmd_observability(
     run_id: str | None = None,
     surface: str | None = None,
     name: str | None = None,
     clear: bool = False,
 ) -> None:
-    """Read agent audit events collected during flow runs."""
+    """Read agent observability events collected during flow runs."""
     if clear:
-        AUDIT_FILE.unlink(missing_ok=True)
+        OBSERVABILITY_FILE.unlink(missing_ok=True)
         if run_id:
-            _audit_file_for_run(run_id).unlink(missing_ok=True)
-        elif AUDIT_DIR.exists():
-            for audit_file in AUDIT_DIR.glob("*.jsonl"):
-                audit_file.unlink(missing_ok=True)
-        print("Audit log cleared.")
+            _observability_file_for_run(run_id).unlink(missing_ok=True)
+        elif OBSERVABILITY_DIR.exists():
+            for observability_file in OBSERVABILITY_DIR.glob("*.jsonl"):
+                observability_file.unlink(missing_ok=True)
+        print("Observability log cleared.")
         return
 
-    print(json.dumps(read_audit_events(run_id, surface, name), indent=2))
+    print(json.dumps(read_observability_events(run_id, surface, name), indent=2))
 
 
 def _find_artifacts_base() -> Path:
@@ -2509,7 +2530,7 @@ def cmd_install(path: str | None = None) -> None:
             android_home=cfg.android_home, emulator_bin=cfg.emulator_bin,
             simulator=cfg.simulator, timeout_boot=cfg.timeout_boot,
             timeout_flow=cfg.timeout_flow, timeout_screenshot=cfg.timeout_screenshot,
-            audit=cfg.audit,
+            observability=cfg.observability,
         )
         platform = AndroidPlatform()
     elif ext in (".zip", ".app") and cfg.platform != "ios":
@@ -2518,7 +2539,7 @@ def cmd_install(path: str | None = None) -> None:
             android_home=cfg.android_home, emulator_bin=cfg.emulator_bin,
             simulator=cfg.simulator, timeout_boot=cfg.timeout_boot,
             timeout_flow=cfg.timeout_flow, timeout_screenshot=cfg.timeout_screenshot,
-            audit=cfg.audit,
+            observability=cfg.observability,
         )
         platform = IOSPlatform()
 
@@ -2658,7 +2679,7 @@ def cmd_tap(
 
 def cmd_open_url(
     url: str,
-    audit_run_id: str | None = None,
+    agent_run_id: str | None = None,
     json_output: bool = False,
 ) -> None:
     """Open a URL or deep link on the running device/simulator."""
@@ -2668,8 +2689,8 @@ def cmd_open_url(
             print(json.dumps({
                 "opened": False,
                 "error": "Device not running. Run: tether boot",
-                "auditEvents": [],
-                "auditTransport": "blocked" if audit_run_id else "unavailable",
+                "observabilityEvents": [],
+                "observabilityTransport": "blocked" if agent_run_id else "unavailable",
                 "healthcheckObserved": False,
                 "diagnostic": "Device not running. Run: tether boot",
                 "logsPath": "",
@@ -2678,7 +2699,7 @@ def cmd_open_url(
             print("Device not running. Run: tether boot")
         sys.exit(1)
 
-    collector = platform.start_log_collector() if audit_run_id else None
+    collector = platform.start_log_collector() if agent_run_id else None
     if collector:
         time.sleep(0.3)
 
@@ -2698,27 +2719,27 @@ def cmd_open_url(
             raise
 
     logs_path = ""
-    audit_events: list[dict] = []
+    observability_events: list[dict] = []
     if collector:
         time.sleep(0.8)
         log_entries = collector.drain()
         logs_path = str(Path(tempfile.mkdtemp(prefix="tether-open-url-")) / "logs.json")
         Path(logs_path).write_text(json.dumps(log_entries, indent=2))
-        audit_events = read_audit_events(run_id=audit_run_id)
+        observability_events = read_observability_events(run_id=agent_run_id)
 
-    audit_summary = _audit_transport_summary(audit_events) if audit_run_id else {
-        "auditTransport": "unavailable",
+    observability_summary = _observability_transport_summary(observability_events) if agent_run_id else {
+        "observabilityTransport": "unavailable",
         "healthcheckObserved": False,
-        "diagnostic": "No audit run id supplied.",
+        "diagnostic": "No agent run id supplied.",
     }
 
     if json_output:
         print(json.dumps({
             "opened": opened,
             "url": url,
-            "auditRunId": audit_run_id or "",
-            "auditEvents": audit_events,
-            **audit_summary,
+            "agentRunId": agent_run_id or "",
+            "observabilityEvents": observability_events,
+            **observability_summary,
             "logsPath": logs_path,
             "message": captured_stdout.getvalue().strip(),
             "error": error,
@@ -2824,14 +2845,14 @@ Reset app state for the configured app, or the provided app id, on the running d
 Android uses pm clear. iOS clears the app data container while keeping the app installed.
 """,
     "open-url": """
-tether open-url <url> [--audit-run-id <id>] [--json]
+tether open-url <url> [--agent-run-id <id>] [--json]
 
 Open a URL or deep link on the running device/simulator.
 The URL is generic. Project-specific code should build app-specific schemes itself.
 
 Options:
-  --audit-run-id <id>  Collect configured audit events for this run while opening.
-  --json              Print machine-readable opened/audit/logs result.
+  --agent-run-id <id>  Collect configured observability events for this run while opening.
+  --json              Print machine-readable opened/observability/logs result.
 """,
     "screen": """
 tether screen [path]
@@ -2976,25 +2997,25 @@ Stdout (--json):
 
 Diagnostics print to stderr. Ctrl+C to stop.
 """,
-    "audit": """
-tether audit [--runId <id>] [--surface <surface>] [--name <name>] [--clear]
+    "observability": """
+tether observability [--runId <id>] [--surface <surface>] [--name <name>] [--clear]
 
-Read agent audit events written during flow runs.
+Read agent observability events written during flow runs.
 
-Events are collected automatically from the configured audit log prefix
-(default: [agent-audit]) whenever a log collector is running (tether flow,
+Events are collected automatically from the configured observability log prefix
+(default: [agent-observability]) whenever a log collector is running (tether flow,
 tether watch, tether logcat --follow).
 
 Options:
   --runId <id>       Filter by agent run ID
   --surface <name>   Filter by surface (mixpanel, sentry, adjust, logger, etc.)
   --name <name>      Filter by event name (track, error, identify, etc.)
-  --clear            Delete the audit log
+  --clear            Delete the observability log
 
 Output:
-  JSON array of matching audit events.
+  JSON array of matching observability events.
 
-Files: /tmp/tether-audit/<runId>.jsonl and legacy /tmp/tether-audit.jsonl
+Files: /tmp/tether-observability/<runId>.jsonl and /tmp/tether-observability.jsonl
 """,
     "sniff": """
 tether sniff [--filter <domains>] [--duration <secs>] [--output <path>]
@@ -3070,26 +3091,26 @@ def main() -> None:
         reset_app_id = next((a for a in args[1:] if not a.startswith("-")), None)
         cmd_reset(reset_app_id)
     elif cmd in ("open-url", "openlink"):
-        audit_run_id = None
+        agent_run_id = None
         url = None
         skip_next = False
         for i, a in enumerate(args[1:], start=1):
             if skip_next:
                 skip_next = False
                 continue
-            if a == "--audit-run-id" and i + 1 < len(args):
-                audit_run_id = args[i + 1]
+            if a == "--agent-run-id" and i + 1 < len(args):
+                agent_run_id = args[i + 1]
                 skip_next = True
-            elif a.startswith("--audit-run-id="):
-                audit_run_id = a.split("=", 1)[1]
+            elif a.startswith("--agent-run-id="):
+                agent_run_id = a.split("=", 1)[1]
             elif a.startswith("-"):
                 continue
             elif url is None:
                 url = a
         if not url:
-            print("Usage: tether open-url <url> [--audit-run-id <id>] [--json]")
+            print("Usage: tether open-url <url> [--agent-run-id <id>] [--json]")
             sys.exit(1)
-        cmd_open_url(url, audit_run_id=audit_run_id, json_output="--json" in args)
+        cmd_open_url(url, agent_run_id=agent_run_id, json_output="--json" in args)
     elif cmd == "tap":
         tap_text = None
         tap_id = None
@@ -3189,7 +3210,7 @@ def main() -> None:
             cmd_watch(w_timeout, w_debounce, w_json)
         except KeyboardInterrupt:
             print("\nstopped", file=sys.stderr)
-    elif cmd == "audit":
+    elif cmd == "observability":
         a_run_id = None
         a_surface = None
         a_name = None
@@ -3201,7 +3222,7 @@ def main() -> None:
                 a_surface = args[i + 1]
             if a == "--name" and i + 1 < len(args):
                 a_name = args[i + 1]
-        cmd_audit(run_id=a_run_id, surface=a_surface, name=a_name, clear=a_clear)
+        cmd_observability(run_id=a_run_id, surface=a_surface, name=a_name, clear=a_clear)
     elif cmd == "sniff":
         if "--last" in args:
             cmd_sniff(last=True)

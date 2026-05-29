@@ -17,7 +17,7 @@ tether install [path]       # Install app binary
 tether launch [appId]       # Launch configured or explicit app
 tether close [appId]        # Stop configured or explicit app
 tether open-url <url>       # Open URL or deep link
-tether open-url <url> --audit-run-id <id> --json  # Open URL and collect audit evidence
+tether open-url <url> --agent-run-id <id> --json  # Open URL and collect observability evidence
 tether screen [path]        # Take screenshot (agent can view)
 tether elements             # Dump visible UI elements with @refs
 tether elements --json      # Machine-readable element dump
@@ -28,18 +28,18 @@ tether progress [--clear]   # Show flow pass/fail history
 tether last-error           # What failed last time
 tether logcat [--follow]    # Filtered device logs
 tether watch                # Auto-capture on UI changes
-tether audit                # Read agent audit events
-tether audit --runId <id>   # Filter audit events by agent run ID
-tether audit --clear        # Clear the audit log
+tether observability                # Read agent observability events
+tether observability --runId <id>   # Filter observability events by agent run ID
+tether observability --clear        # Clear the observability log
 ```
 
-## Agent audit events
+## Agent observability events
 
-Apps can emit structured audit log lines with a project-configured prefix. The default prefix is `[agent-audit]` and the default run ID field is `runId`.
+Apps can emit structured observability log lines with a project-configured prefix. The default prefix is `[agent-observability]` and the default run ID field is `runId`.
 
-Use `tether open-url <url> --audit-run-id <id> --json` when deep-link transport and audit collection must be checked together. JSON output includes `auditEvents`, `auditTransport`, and `healthcheckObserved` when the project config defines a required healthcheck.
+Use `tether open-url <url> --agent-run-id <id> --json` when deep-link transport and observability collection must be checked together. JSON output includes `observabilityEvents`, `observabilityTransport`, and `healthcheckObserved` when the project config defines a required healthcheck.
 
-If `auditTransport` is `blocked`, do not treat missing target events as app behavior. First fix the sink or healthcheck path.
+If `observabilityTransport` is `blocked`, do not treat missing target events as app behavior. First fix the sink or healthcheck path.
 
 ## Config (tether.json)
 
@@ -56,12 +56,12 @@ If `auditTransport` is `blocked`, do not treat missing target events as app beha
     }
   },
   "timeouts": { "boot": 90, "flow": 180, "screenshot": 10 },
-  "audit": {
-    "prefix": "[agent-audit]",
+  "observability": {
+    "prefix": "[agent-observability]",
     "runIdField": "runId",
     "healthcheck": {
-      "surface": "agentAudit",
-      "name": "agentAudit.healthcheck",
+      "surface": "agentObservability",
+      "name": "agentObservability.healthcheck",
       "required": true
     }
   }
@@ -77,12 +77,6 @@ For iOS:
 }
 ```
 
-## Workflow
+## Scope
 
-1. Run `tether doctor` to validate the stack
-2. Run `tether boot` to start emulator/simulator
-3. Optionally run `tether install <path>` and `tether launch` for app setup
-4. Use `tether inspect` to see current state (screenshot + elements + logs)
-5. Write Maestro flow YAML based on visible elements and @refs
-6. Run `tether flow <path>` to test
-7. Check `tether last-error` on failure, iterate
+Use `tether --help` for the short operating loop and command-choice guidance. This skill covers deeper observability, config, and Maestro YAML details.

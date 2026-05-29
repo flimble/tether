@@ -45,12 +45,12 @@ SNIFF_LAST = _ns["SNIFF_LAST"]
 _MITM_ADDON_TEMPLATE = _ns["_MITM_ADDON_TEMPLATE"]
 check_mitmproxy_installed = _ns["check_mitmproxy_installed"]
 check_mitmproxy_ca = _ns["check_mitmproxy_ca"]
-read_audit_events = _ns["read_audit_events"]
+read_observability_events = _ns["read_observability_events"]
 cmd_open_url = _ns["cmd_open_url"]
-AuditConfig = _ns["AuditConfig"]
-AuditHealthcheckConfig = _ns["AuditHealthcheckConfig"]
-_audit_transport_summary = _ns["_audit_transport_summary"]
-_audit_file_for_run = _ns["_audit_file_for_run"]
+ObservabilityConfig = _ns["ObservabilityConfig"]
+ObservabilityHealthcheckConfig = _ns["ObservabilityHealthcheckConfig"]
+_observability_transport_summary = _ns["_observability_transport_summary"]
+_observability_file_for_run = _ns["_observability_file_for_run"]
 LogcatCollector = _ns["LogcatCollector"]
 _maestro_tap_flow_yaml = _ns["_maestro_tap_flow_yaml"]
 _element_center_point = _ns["_element_center_point"]
@@ -550,6 +550,27 @@ class TestIOSLaunch(unittest.TestCase):
 
         self.assertEqual(calls[0], ["xcrun", "simctl", "terminate", "SIM-123", "com.other.app"])
 
+    def test_close_ignores_ios_app_not_running_errors(self):
+        p = IOSPlatform()
+        calls = []
+
+        def fake_run_cmd(args, **kwargs):
+            calls.append(args)
+            return (
+                3,
+                "",
+                "An error was encountered processing the command (domain=NSPOSIXErrorDomain, code=3):\n"
+                "Simulator device failed to terminate com.other.app.\n"
+                "Underlying error (domain=NSPOSIXErrorDomain, code=3):\n"
+                "\tThe request to terminate \"com.other.app\" failed. found nothing to terminate\n"
+                "\tfound nothing to terminate",
+            )
+
+        with patch.dict(p.close_app.__globals__, {"run_cmd": fake_run_cmd}):
+            p.close_app("com.other.app")
+
+        self.assertEqual(calls[0], ["xcrun", "simctl", "terminate", "SIM-123", "com.other.app"])
+
     def test_open_url_uses_maestro_when_app_id_is_configured(self):
         p = IOSPlatform()
         calls = []
@@ -887,34 +908,34 @@ class TestMitmAddonTemplate(unittest.TestCase):
         self.assertIn("addons = [TetherAddon()]", rendered)
 
 
-class TestAuditCommands(unittest.TestCase):
+class TestObservabilityCommands(unittest.TestCase):
 
-    def test_read_audit_events_filters_by_run_surface_and_name(self):
+    def test_read_observability_events_filters_by_run_surface_and_name(self):
         with tempfile.TemporaryDirectory() as tmp:
-            audit_path = Path(tmp) / "audit.jsonl"
-            audit_dir = Path(tmp) / "per-run"
-            audit_path.write_text(
+            observability_path = Path(tmp) / "observability.jsonl"
+            observability_dir = Path(tmp) / "per-run"
+            observability_path.write_text(
                 json.dumps({"runId": "run-1", "surface": "navigation", "name": "received"}) + "\n" +
                 json.dumps({"runId": "run-2", "surface": "navigation", "name": "received"}) + "\n" +
                 "not-json\n"
             )
-            previous_audit = _ns["AUDIT_FILE"]
-            previous_dir = _ns["AUDIT_DIR"]
+            previous_observability = _ns["OBSERVABILITY_FILE"]
+            previous_dir = _ns["OBSERVABILITY_DIR"]
             previous_cfg = _ns.get("cfg")
-            _ns["AUDIT_FILE"] = audit_path
-            _ns["AUDIT_DIR"] = audit_dir
+            _ns["OBSERVABILITY_FILE"] = observability_path
+            _ns["OBSERVABILITY_DIR"] = observability_dir
             _ns["cfg"] = None
             try:
                 self.assertEqual(
-                    read_audit_events(run_id="run-1", surface="navigation", name="received"),
+                    read_observability_events(run_id="run-1", surface="navigation", name="received"),
                     [{"runId": "run-1", "surface": "navigation", "name": "received"}],
                 )
             finally:
-                _ns["AUDIT_FILE"] = previous_audit
-                _ns["AUDIT_DIR"] = previous_dir
+                _ns["OBSERVABILITY_FILE"] = previous_observability
+                _ns["OBSERVABILITY_DIR"] = previous_dir
                 _ns["cfg"] = previous_cfg
 
-    def test_audit_transport_summary_uses_configured_healthcheck(self):
+    def test_observability_transport_summary_uses_configured_healthcheck(self):
         previous_cfg = _ns.get("cfg")
         _ns["cfg"] = Config(
             platform="ios",
@@ -926,9 +947,9 @@ class TestAuditCommands(unittest.TestCase):
             timeout_boot=1,
             timeout_flow=1,
             timeout_screenshot=1,
-            audit=AuditConfig(
-                healthcheck=AuditHealthcheckConfig(
-                    surface="audit",
+            observability=ObservabilityConfig(
+                healthcheck=ObservabilityHealthcheckConfig(
+                    surface="observability",
                     name="healthcheck",
                     required=True,
                 ),
@@ -936,27 +957,27 @@ class TestAuditCommands(unittest.TestCase):
         )
         try:
             self.assertEqual(
-                _audit_transport_summary([])["auditTransport"],
+                _observability_transport_summary([])["observabilityTransport"],
                 "blocked",
             )
             self.assertEqual(
-                _audit_transport_summary([
-                    {"runId": "run-1", "surface": "audit", "name": "healthcheck"}
-                ])["auditTransport"],
+                _observability_transport_summary([
+                    {"runId": "run-1", "surface": "observability", "name": "healthcheck"}
+                ])["observabilityTransport"],
                 "passed",
             )
         finally:
             _ns["cfg"] = previous_cfg
 
-    def test_collector_uses_configured_audit_prefix_and_run_id_field(self):
+    def test_collector_uses_configured_observability_prefix_and_run_id_field(self):
         with tempfile.TemporaryDirectory() as tmp:
-            audit_path = Path(tmp) / "audit.jsonl"
-            audit_dir = Path(tmp) / "per-run"
-            previous_audit = _ns["AUDIT_FILE"]
-            previous_dir = _ns["AUDIT_DIR"]
+            observability_path = Path(tmp) / "observability.jsonl"
+            observability_dir = Path(tmp) / "per-run"
+            previous_observability = _ns["OBSERVABILITY_FILE"]
+            previous_dir = _ns["OBSERVABILITY_DIR"]
             previous_cfg = _ns.get("cfg")
-            _ns["AUDIT_FILE"] = audit_path
-            _ns["AUDIT_DIR"] = audit_dir
+            _ns["OBSERVABILITY_FILE"] = observability_path
+            _ns["OBSERVABILITY_DIR"] = observability_dir
             _ns["cfg"] = Config(
                 platform="ios",
                 avd="",
@@ -967,24 +988,24 @@ class TestAuditCommands(unittest.TestCase):
                 timeout_boot=1,
                 timeout_flow=1,
                 timeout_screenshot=1,
-                audit=AuditConfig(prefix="[custom-audit]", run_id_field="testRunId"),
+                observability=ObservabilityConfig(prefix="[custom-observability]", run_id_field="testRunId"),
             )
             try:
                 collector = LogcatCollector()
-                collector._maybe_write_audit(
-                    'log line [custom-audit] {"testRunId":"run/1","surface":"cms","name":"request"}'
+                collector._maybe_write_observability(
+                    'log line [custom-observability] {"testRunId":"run/1","surface":"cms","name":"request"}'
                 )
                 self.assertEqual(
-                    read_audit_events(run_id="run/1"),
+                    read_observability_events(run_id="run/1"),
                     [{"testRunId": "run/1", "surface": "cms", "name": "request"}],
                 )
-                self.assertTrue(_audit_file_for_run("run/1").exists())
+                self.assertTrue(_observability_file_for_run("run/1").exists())
             finally:
-                _ns["AUDIT_FILE"] = previous_audit
-                _ns["AUDIT_DIR"] = previous_dir
+                _ns["OBSERVABILITY_FILE"] = previous_observability
+                _ns["OBSERVABILITY_DIR"] = previous_dir
                 _ns["cfg"] = previous_cfg
 
-    def test_open_url_json_collects_audit_events_logs_and_healthcheck(self):
+    def test_open_url_json_collects_observability_events_logs_and_healthcheck(self):
         class FakeCollector:
             def drain(self):
                 return [{"line": "log", "severity": "info"}]
@@ -1000,19 +1021,19 @@ class TestAuditCommands(unittest.TestCase):
                 print(f"opened {url}")
 
         with tempfile.TemporaryDirectory() as tmp:
-            audit_path = Path(tmp) / "audit.jsonl"
-            audit_dir = Path(tmp) / "per-run"
-            audit_path.write_text(
-                json.dumps({"runId": "run-1", "surface": "agentAudit", "name": "agentAudit.healthcheck"}) + "\n" +
+            observability_path = Path(tmp) / "observability.jsonl"
+            observability_dir = Path(tmp) / "per-run"
+            observability_path.write_text(
+                json.dumps({"runId": "run-1", "surface": "agentObservability", "name": "agentObservability.healthcheck"}) + "\n" +
                 json.dumps({"runId": "run-1", "surface": "navigation", "name": "agentScreen.received"}) + "\n"
             )
             previous_platform = _ns.get("platform")
-            previous_audit = _ns["AUDIT_FILE"]
-            previous_dir = _ns["AUDIT_DIR"]
+            previous_observability = _ns["OBSERVABILITY_FILE"]
+            previous_dir = _ns["OBSERVABILITY_DIR"]
             previous_cfg = _ns.get("cfg")
             _ns["platform"] = FakePlatform()
-            _ns["AUDIT_FILE"] = audit_path
-            _ns["AUDIT_DIR"] = audit_dir
+            _ns["OBSERVABILITY_FILE"] = observability_path
+            _ns["OBSERVABILITY_DIR"] = observability_dir
             _ns["cfg"] = Config(
                 platform="ios",
                 avd="",
@@ -1023,28 +1044,28 @@ class TestAuditCommands(unittest.TestCase):
                 timeout_boot=1,
                 timeout_flow=1,
                 timeout_screenshot=1,
-                audit=AuditConfig(
-                    healthcheck=AuditHealthcheckConfig(
-                        surface="agentAudit",
-                        name="agentAudit.healthcheck",
+                observability=ObservabilityConfig(
+                    healthcheck=ObservabilityHealthcheckConfig(
+                        surface="agentObservability",
+                        name="agentObservability.healthcheck",
                         required=True,
                     ),
                 ),
             )
             try:
                 with patch("sys.stdout", new_callable=io.StringIO) as stdout:
-                    cmd_open_url("app://test", audit_run_id="run-1", json_output=True)
+                    cmd_open_url("app://test", agent_run_id="run-1", json_output=True)
                 output = json.loads(stdout.getvalue())
                 self.assertTrue(output["opened"])
                 self.assertEqual(output["message"], "opened app://test")
-                self.assertEqual(output["auditEvents"][0]["runId"], "run-1")
-                self.assertEqual(output["auditTransport"], "passed")
+                self.assertEqual(output["observabilityEvents"][0]["runId"], "run-1")
+                self.assertEqual(output["observabilityTransport"], "passed")
                 self.assertTrue(output["healthcheckObserved"])
                 self.assertTrue(Path(output["logsPath"]).exists())
             finally:
                 _ns["platform"] = previous_platform
-                _ns["AUDIT_FILE"] = previous_audit
-                _ns["AUDIT_DIR"] = previous_dir
+                _ns["OBSERVABILITY_FILE"] = previous_observability
+                _ns["OBSERVABILITY_DIR"] = previous_dir
                 _ns["cfg"] = previous_cfg
 
 

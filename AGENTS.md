@@ -24,7 +24,7 @@ tether install [path]       # install app binary
 tether launch [appId]       # launch configured or explicit app
 tether close [appId]        # stop configured or explicit app
 tether open-url <url>       # open URL or deep link
-tether open-url <url> --audit-run-id <id> --json  # open URL and collect matching [agent-audit] events
+tether open-url <url> --agent-run-id <id> --json  # open URL and collect matching [agent-observability] events
 tether screen [path]        # screenshot
 tether elements [--json]    # element dump with @refs
 tether inspect              # screenshot + elements + logs (JSON)
